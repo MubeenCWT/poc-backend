@@ -1,0 +1,28 @@
+from typing import TypedDict, Optional, List, Dict, Any
+
+class ChatState(TypedDict, total=False):
+    session_id: str
+    phone: str
+    incoming_message: str
+    intent: Optional[str]  # booking, maintenance, discount_check, general
+    reply: Optional[str]
+
+    # multi-step flow
+    current_step: Optional[str]
+
+    # booking slot-filling
+    guest_name: Optional[str]
+    selected_property: Optional[str]
+    start_date: Optional[str]
+    end_date: Optional[str]
+    booking_type: Optional[str]
+    wants_discount: Optional[bool]
+    quote_amount: Optional[float]
+
+    # maintenance slot-filling
+    unit_id: Optional[str]
+    issue_type: Optional[str]
+    issue_description: Optional[str]
+
+    # discount status check
+    check_name: Optional[str]
