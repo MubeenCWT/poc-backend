@@ -12,9 +12,14 @@ from app.config import settings
 
 def _api_base() -> str:
     base = (settings.API_BASE_URL or "").strip()
-    if base:
+    # Ignore a stale localhost:8000 override — nothing listens there on Railway.
+    if base and "localhost:8000" not in base and "127.0.0.1:8000" not in base:
         return base.rstrip("/")
-    # Fall back to this same container's port (Railway sets $PORT, e.g. 8080).
+    # On Railway, call our own public domain (always reachable).
+    public = os.environ.get("RAILWAY_PUBLIC_DOMAIN")
+    if public:
+        return f"https://{public}"
+    # Local dev / same container: use the port we're actually bound to.
     return f"http://localhost:{os.environ.get('PORT', '8000')}"
 
 
