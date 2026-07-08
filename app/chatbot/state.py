@@ -16,8 +16,10 @@ class ChatState(TypedDict, total=False):
     start_date: Optional[str]
     end_date: Optional[str]
     booking_type: Optional[str]
+    months_count: Optional[int]
     wants_discount: Optional[bool]
     quote_amount: Optional[float]
+    booking_id: Optional[str]
 
     # maintenance slot-filling
     unit_id: Optional[str]

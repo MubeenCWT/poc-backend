@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 
 from app.database import Base, engine
 from app.models import models
-from app.routers import auth, properties, bookings, vendors, maintenance, chat, notifications
+from app.routers import auth, properties, bookings, vendors, maintenance, chat, notifications, whatsapp_webhook
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -29,6 +29,7 @@ app.include_router(vendors.router, prefix="/api")
 app.include_router(maintenance.router, prefix="/api")
 app.include_router(chat.router, prefix="/api")
 app.include_router(notifications.router, prefix="/api")
+app.include_router(whatsapp_webhook.router)  # no /api prefix — Meta calls /webhook/whatsapp
 
 @app.get("/api")
 def root():

@@ -7,17 +7,28 @@ from app.database import get_db
 from app.models.models import Booking, Property, PropertyAvailability, DiscountRequest, User, AdminNotification
 from app.schemas.schemas import BookingCreate, BookingOut, DiscountDecision
 from app.services.deps import get_current_admin
-#from app.services.whatsapp import notify_admin
+from app.services.notify import send_admin_alert, send_whatsapp_text
+from app.services.discounts import apply_discount_decision
 
 router = APIRouter(prefix="/bookings", tags=["bookings"])
 
 
-def _price_for_type(prop: Property, booking_type: str) -> float:
-    return {
-        "daily": prop.price_daily,
-        "monthly": prop.price_monthly,
-        "yearly": prop.price_yearly,
-    }[booking_type]
+def _months_between(start_date, end_date) -> int:
+    return (end_date.year - start_date.year) * 12 + (end_date.month - start_date.month)
+
+
+def _compute_base_price(prop: Property, booking_type: str, start_date, end_date) -> float:
+    """Duration-aware price so bills reflect the actual length of stay."""
+    if booking_type == "daily":
+        nights = max((end_date - start_date).days, 1)
+        return float(prop.price_daily or 0) * nights
+    if booking_type == "monthly":
+        months = max(_months_between(start_date, end_date), 1)
+        return float(prop.price_monthly or 0) * months
+    if booking_type == "yearly":
+        years = max(round(_months_between(start_date, end_date) / 12) or 1, 1)
+        return float(prop.price_yearly or 0) * years
+    raise HTTPException(400, "Invalid booking_type")
 
 
 def _has_conflict(db: Session, property_id: str, start_date, end_date) -> bool:
@@ -32,14 +43,27 @@ def _has_conflict(db: Session, property_id: str, start_date, end_date) -> bool:
     return overlap is not None
 
 
+async def _push_alert(message: str):
+    await send_admin_alert(message)
+
+
+async def _push_text(to: str, message: str):
+    await send_whatsapp_text(to, message)
+
+
 @router.get("/check-availability")
 def check_availability(property_id: str, start_date: str, end_date: str, db: Session = Depends(get_db)):
     if _has_conflict(db, property_id, start_date, end_date):
         return {"available": False}
     return {"available": True}
 
+
 @router.post("/", response_model=BookingOut)
-def create_booking(payload: BookingCreate, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+async def create_booking(
+    payload: BookingCreate,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
     if payload.end_date < payload.start_date:
         raise HTTPException(status_code=400, detail="end_date cannot be before start_date")
 
@@ -50,7 +74,7 @@ def create_booking(payload: BookingCreate, background_tasks: BackgroundTasks, db
     if _has_conflict(db, payload.property_id, payload.start_date, payload.end_date):
         raise HTTPException(409, "Property is not available for the selected dates")
 
-    base_price = _price_for_type(prop, payload.booking_type)
+    base_price = _compute_base_price(prop, payload.booking_type, payload.start_date, payload.end_date)
 
     booking = Booking(
         property_id=payload.property_id,
@@ -68,7 +92,7 @@ def create_booking(payload: BookingCreate, background_tasks: BackgroundTasks, db
         source=payload.source,
     )
     db.add(booking)
-    db.flush()  # get booking.id before commit
+    db.flush()
 
     availability = PropertyAvailability(
         property_id=payload.property_id,
@@ -92,21 +116,28 @@ def create_booking(payload: BookingCreate, background_tasks: BackgroundTasks, db
         f"Property: {prop.title}\n"
         f"Guest: {payload.guest_name} ({payload.guest_phone})\n"
         f"Dates: {payload.start_date} to {payload.end_date}\n"
-        f"Type: {payload.booking_type}, Base price: {base_price}"
+        f"Type: {payload.booking_type}, Base price: AED {base_price}"
     )
     if payload.discount_requested:
-        notification_text += f"\nDiscount requested: {payload.discount_amount} — needs your approval."
+        ref = booking.id[:8].upper()
+        notification_text += (
+            f"\nDiscount requested: AED {payload.discount_amount}."
+            f"\n\nReply here to decide:"
+            f"\n  APPROVE {ref}"
+            f"\n  REJECT {ref}"
+        )
 
     db.add(AdminNotification(type="new_booking", reference_id=booking.id, message=notification_text))
     db.commit()
     db.refresh(booking)
+
+    background_tasks.add_task(_push_alert, notification_text)
 
     return booking
 
 
 @router.get("/", response_model=List[BookingOut])
 def list_bookings(db: Session = Depends(get_db), admin: User = Depends(get_current_admin)):
-    """Admin-only: view all bookings in the portal."""
     return db.query(Booking).order_by(Booking.created_at.desc()).all()
 
 
@@ -119,39 +150,97 @@ def get_booking(booking_id: str, db: Session = Depends(get_db)):
 
 
 @router.post("/{booking_id}/confirm", response_model=BookingOut)
-def confirm_booking(booking_id: str, db: Session = Depends(get_db), admin: User = Depends(get_current_admin)):
+async def confirm_booking(
+    booking_id: str,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    admin: User = Depends(get_current_admin),
+):
     booking = db.query(Booking).filter(Booking.id == booking_id).first()
+    if not booking:
+        raise HTTPException(404, "Booking not found")
+    if booking.status == "confirmed":
+        return booking
+
     booking.status = "confirmed"
+    if booking.final_price is None:
+        booking.final_price = booking.base_price
+
+    prop = db.query(Property).filter(Property.id == booking.property_id).first()
+    message = (
+        f"Booking confirmed:\n"
+        f"Property: {prop.title if prop else booking.property_id}\n"
+        f"Guest: {booking.guest_name}\n"
+        f"Dates: {booking.start_date} to {booking.end_date}\n"
+        f"Total: AED {booking.final_price}"
+    )
+    db.add(AdminNotification(type="booking_confirmed", reference_id=booking.id, message=message))
     db.commit()
     db.refresh(booking)
+
+    background_tasks.add_task(_push_alert, message)
+    return booking
+
+
+@router.post("/{booking_id}/guest-confirm", response_model=BookingOut)
+async def guest_confirm_booking(
+    booking_id: str,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    """Guest accepts full price after a rejected discount — confirms a pending booking."""
+    booking = db.query(Booking).filter(Booking.id == booking_id).first()
+    if not booking:
+        raise HTTPException(404, "Booking not found")
+    if booking.status == "confirmed":
+        return booking
+    if booking.status != "pending":
+        raise HTTPException(400, detail="Booking cannot be confirmed in its current state")
+
+    booking.status = "confirmed"
+    booking.final_price = booking.base_price
+
+    prop = db.query(Property).filter(Property.id == booking.property_id).first()
+    message = (
+        f"Guest confirmed at full price:\n"
+        f"Property: {prop.title if prop else booking.property_id}\n"
+        f"Guest: {booking.guest_name}\n"
+        f"Dates: {booking.start_date} to {booking.end_date}\n"
+        f"Total: AED {booking.final_price}"
+    )
+    db.add(AdminNotification(type="booking_confirmed", reference_id=booking.id, message=message))
+    db.commit()
+    db.refresh(booking)
+
+    background_tasks.add_task(_push_alert, message)
     return booking
 
 
 @router.post("/{booking_id}/discount-decision", response_model=BookingOut)
-def decide_discount(
+async def decide_discount(
     booking_id: str,
     decision: DiscountDecision,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     admin: User = Depends(get_current_admin),
 ):
-    """Admin approves or rejects a discount request from the portal."""
     booking = db.query(Booking).filter(Booking.id == booking_id).first()
-    discount_req = db.query(DiscountRequest).filter(DiscountRequest.booking_id == booking_id).first()
+    if not booking:
+        raise HTTPException(404, "Booking not found")
 
-    if decision.approve:
-        booking.discount_status = "approved"
-        booking.final_price = float(booking.base_price) - float(booking.discount_amount)
-        if discount_req:
-            discount_req.status = "approved"
-    else:
-        booking.discount_status = "rejected"
-        booking.final_price = booking.base_price
-        if discount_req:
-            discount_req.status = "rejected"
+    tenant_msg = apply_discount_decision(db, booking, decision.approve, decided_by=admin.id)
 
-    if discount_req:
-        discount_req.decided_by = admin.id
-
+    notif_type = "discount_approved" if decision.approve else "discount_rejected"
+    log = (
+        f"Discount {'approved' if decision.approve else 'rejected'} for booking "
+        f"{booking.id[:8].upper()} — tenant notified."
+    )
+    db.add(AdminNotification(type=notif_type, reference_id=booking.id, message=log))
     db.commit()
     db.refresh(booking)
+
+    # The decision message goes to the TENANT, not the admin.
+    if booking.guest_phone and booking.guest_phone != "web":
+        background_tasks.add_task(_push_text, booking.guest_phone, tenant_msg)
+
     return booking

@@ -63,6 +63,8 @@ class BookingOut(BaseModel):
     start_date: date
     end_date: date
     base_price: float
+    discount_requested: bool = False
+    discount_amount: Optional[float] = 0
     discount_status: str
     final_price: Optional[float]
     status: str
@@ -87,6 +89,10 @@ class VendorOut(VendorCreate):
 
     class Config:
         from_attributes = True
+
+
+class VendorAssign(BaseModel):
+    vendor_id: str
 
 
 # ---------- Maintenance ----------
