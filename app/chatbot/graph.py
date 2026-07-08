@@ -1,5 +1,6 @@
 import calendar
 import datetime
+import os
 
 import httpx
 from langgraph.graph import StateGraph, END
@@ -10,7 +11,11 @@ from app.config import settings
 
 
 def _api_base() -> str:
-    return settings.API_BASE_URL.rstrip("/")
+    base = (settings.API_BASE_URL or "").strip()
+    if base:
+        return base.rstrip("/")
+    # Fall back to this same container's port (Railway sets $PORT, e.g. 8080).
+    return f"http://localhost:{os.environ.get('PORT', '8000')}"
 
 
 def _parse_iso(value: str):

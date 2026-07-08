@@ -19,8 +19,9 @@ class Settings(BaseSettings):
     META_API_VERSION: str = "v21.0"
     META_VERIFY_TOKEN: str = ""       # webhook verification token (matches Meta dashboard)
 
-    # Used by the chatbot graph when calling back into this API
-    API_BASE_URL: str = "http://localhost:8000"
+    # Used by the chatbot graph when calling back into this API.
+    # Leave empty to auto-detect http://localhost:$PORT (works on Railway).
+    API_BASE_URL: str = ""
 
     LLM_API_BASE: str = ""
     LLM_API_KEY: str = ""
