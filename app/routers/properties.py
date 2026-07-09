@@ -1,5 +1,5 @@
 from typing import List, Optional
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -28,9 +28,21 @@ def list_properties(
     return query.all()
 
 
+@router.get("/admin/all", response_model=List[PropertyOut])
+def list_properties_admin(
+    db: Session = Depends(get_db),
+    admin: User = Depends(get_current_admin),
+):
+    """Admin-only: all properties including removed ones."""
+    return db.query(Property).order_by(Property.created_at.desc()).all()
+
+
 @router.get("/{property_id}", response_model=PropertyOut)
 def get_property(property_id: str, db: Session = Depends(get_db)):
-    return db.query(Property).filter(Property.id == property_id).first()
+    prop = db.query(Property).filter(Property.id == property_id).first()
+    if not prop:
+        raise HTTPException(status_code=404, detail="Property not found")
+    return prop
 
 
 @router.post("/", response_model=PropertyOut)
@@ -55,6 +67,8 @@ def update_property(
     admin: User = Depends(get_current_admin),
 ):
     prop = db.query(Property).filter(Property.id == property_id).first()
+    if not prop:
+        raise HTTPException(status_code=404, detail="Property not found")
     for key, value in payload.model_dump().items():
         setattr(prop, key, value)
     db.commit()
@@ -68,7 +82,28 @@ def delete_property(
     db: Session = Depends(get_db),
     admin: User = Depends(get_current_admin),
 ):
+    """Soft-delete: hides property from public listings. Bookings are kept."""
     prop = db.query(Property).filter(Property.id == property_id).first()
+    if not prop:
+        raise HTTPException(status_code=404, detail="Property not found")
+    if prop.status == "inactive":
+        return {"ok": True, "message": "Property already removed"}
     prop.status = "inactive"
     db.commit()
-    return {"ok": True}
+    return {"ok": True, "message": "Property removed from listings"}
+
+
+@router.post("/{property_id}/restore", response_model=PropertyOut)
+def restore_property(
+    property_id: str,
+    db: Session = Depends(get_db),
+    admin: User = Depends(get_current_admin),
+):
+    """Re-publish a previously removed property."""
+    prop = db.query(Property).filter(Property.id == property_id).first()
+    if not prop:
+        raise HTTPException(status_code=404, detail="Property not found")
+    prop.status = "active"
+    db.commit()
+    db.refresh(prop)
+    return prop

@@ -11,7 +11,7 @@ router = APIRouter(prefix="/maintenance", tags=["maintenance"])
 
 
 async def _push_alert(message: str):
-    await send_admin_alert(message)
+    await send_admin_alert(message, title="Maintenance Request")
 
 
 def _match_vendors(db: Session, issue_type: str, area: str | None) -> list[Vendor]:
