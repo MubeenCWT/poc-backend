@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models.models import Property, User
 from app.schemas.schemas import PropertyCreate, PropertyOut
-from app.services.deps import get_current_admin
+from app.services.deps import get_current_admin, get_optional_admin
 
 router = APIRouter(prefix="/properties", tags=["properties"])
 
@@ -15,9 +15,16 @@ def list_properties(
     emirate: Optional[str] = None,
     area: Optional[str] = None,
     property_type: Optional[str] = None,
+    include_inactive: bool = False,
     db: Session = Depends(get_db),
+    admin: Optional[User] = Depends(get_optional_admin),
 ):
-    """Public endpoint - powers the website listing page and the chatbot's search."""
+    """Public listings by default. Admins may pass include_inactive=true to see all."""
+    if include_inactive:
+        if admin is None:
+            raise HTTPException(status_code=401, detail="Admin authentication required")
+        return db.query(Property).order_by(Property.created_at.desc()).all()
+
     query = db.query(Property).filter(Property.status == "active")
     if emirate:
         query = query.filter(Property.emirate == emirate)
@@ -33,7 +40,7 @@ def list_properties_admin(
     db: Session = Depends(get_db),
     admin: User = Depends(get_current_admin),
 ):
-    """Admin-only: all properties including removed ones."""
+    """Admin-only alias — prefer GET /?include_inactive=true on older deployments."""
     return db.query(Property).order_by(Property.created_at.desc()).all()
 
 
