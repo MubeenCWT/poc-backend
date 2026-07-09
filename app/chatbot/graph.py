@@ -42,25 +42,126 @@ def _months_between(start: datetime.date, end: datetime.date) -> int:
     return (end.year - start.year) * 12 + (end.month - start.month)
 
 
-async def _quote_and_advance(state: ChatState, months: int | None = None) -> bool:
-    """Check availability, compute a duration-aware quote, and move to wait_confirm.
+def _month_bounds(year: int, month: int) -> tuple[datetime.date, datetime.date]:
+    start = datetime.date(year, month, 1)
+    last_day = calendar.monthrange(year, month)[1]
+    return start, datetime.date(year, month, last_day)
 
-    Returns False if the property is unavailable for the chosen period (the caller
-    is responsible for choosing which step to fall back to)."""
-    async with httpx.AsyncClient() as client:
-        avail_resp = await client.get(
-            f"{_api_base()}/api/bookings/check-availability",
-            params={
-                "property_id": state["selected_property"],
-                "start_date": state["start_date"],
-                "end_date": state["end_date"],
-            },
-        )
-        if not avail_resp.json().get("available", True):
-            return False
-        prop_resp = await client.get(f"{_api_base()}/api/properties/{state['selected_property']}")
-        prop = prop_resp.json()
 
+def _this_month_bounds(today: datetime.date | None = None) -> tuple[datetime.date, datetime.date]:
+    today = today or datetime.date.today()
+    start, end = _month_bounds(today.year, today.month)
+    if today.day > 1:
+        start = today
+    return start, end
+
+
+def _month_label(d: datetime.date) -> str:
+    return d.strftime("%B %Y")
+
+
+async def _check_availability(
+    client: httpx.AsyncClient, property_id: str, start_date: str, end_date: str
+) -> bool:
+    resp = await client.get(
+        f"{_api_base()}/api/bookings/check-availability",
+        params={
+            "property_id": property_id,
+            "start_date": start_date,
+            "end_date": end_date,
+        },
+    )
+    if resp.status_code != 200:
+        return False
+    return bool(resp.json().get("available", False))
+
+
+AVAILABILITY_KEYWORDS = (
+    "available", "availability", "free", "vacant", "open",
+    "booked", "occupied", "not available", "unavailable",
+)
+MONTH_WORDS = (
+    "january", "february", "march", "april", "may", "june",
+    "july", "august", "september", "october", "november", "december",
+    "month", "this month", "next month",
+)
+
+
+async def _resolve_availability_period(msg: str, current_year: int) -> tuple[datetime.date, datetime.date, str] | None:
+    """Parse a month or date range from the user's message."""
+    lower = msg.lower()
+    today = datetime.date.today()
+
+    if "this month" in lower:
+        start, end = _this_month_bounds(today)
+        return start, end, _month_label(today)
+
+    if "next month" in lower:
+        anchor = _add_months(today.replace(day=1), 1)
+        start, end = _month_bounds(anchor.year, anchor.month)
+        return start, end, _month_label(anchor)
+
+    prompt = (
+        f"Extract the month or date range the user is asking about. "
+        f"Return exactly two ISO dates separated by a comma: start,end. "
+        f"For a single month use YYYY-MM-01 as start and the last day of that month as end. "
+        f"Assume the year is {current_year} unless specified. Today is {today.isoformat()}."
+    )
+    raw = (await call_llm(prompt, msg)).strip()
+    parts = [p.strip() for p in raw.split(",")]
+    if len(parts) != 2:
+        return None
+    start = _parse_iso(parts[0])
+    end = _parse_iso(parts[1])
+    if not start or not end:
+        return None
+    if end < start:
+        start, end = end, start
+    label = _month_label(start) if start.day == 1 and end.day >= 28 else f"{start.isoformat()} to {end.isoformat()}"
+    return start, end, label
+
+
+def _match_property(props: list, query: str):
+    q = query.lower().strip()
+    if not q or q == "unknown":
+        return None
+    for p in props:
+        title = (p.get("title") or "").lower()
+        area = (p.get("area") or "").lower()
+        if q in title or title in q or (area and (q in area or area in q)):
+            return p
+    return None
+
+
+# Words that must never be accepted as a guest name.
+_INVALID_NAME_WORDS = {
+    "yes", "no", "ok", "okay", "sure", "confirm", "y", "n", "yeah", "yep", "nah",
+    "book", "booking", "hi", "hello", "thanks", "thank you",
+}
+
+
+def _is_valid_guest_name(name: str | None) -> bool:
+    if not name:
+        return False
+    cleaned = " ".join(name.strip().split())
+    if len(cleaned) < 2:
+        return False
+    if cleaned.lower() in _INVALID_NAME_WORDS:
+        return False
+    if cleaned.isdigit():
+        return False
+    return any(c.isalpha() for c in cleaned)
+
+
+async def _extract_guest_name(msg: str) -> str:
+    prompt = (
+        "Extract the person's full name from this message. "
+        "Return ONLY the name. If no real name is given, return UNKNOWN."
+    )
+    return (await call_llm(prompt, msg)).strip()
+
+
+def _build_quote_reply(state: ChatState, prop: dict, months: int | None = None) -> str:
     start = datetime.date.fromisoformat(state["start_date"])
     end = datetime.date.fromisoformat(state["end_date"])
     btype = state["booking_type"]
@@ -73,21 +174,45 @@ async def _quote_and_advance(state: ChatState, months: int | None = None) -> boo
         units = months if months else max(_months_between(start, end), 1)
         unit_label = "month" if units == 1 else "months"
         unit_price = float(prop["price_monthly"])
-    else:  # yearly
+    else:
         units = 1
         unit_label = "year"
         unit_price = float(prop["price_yearly"])
 
     total = unit_price * units
     state["quote_amount"] = total
-    state["reply"] = (
+    return (
         f"Here is your quote:\n"
         f"Property: {prop['title']}\n"
         f"Dates: {state['start_date']} to {state['end_date']}\n"
         f"Type: {btype} — {units} {unit_label} x AED {unit_price:g}\n"
-        f"Total: AED {total:g}\n\n"
-        f"Shall I confirm this booking? (yes/no)"
+        f"Total: AED {total:g}"
     )
+
+
+async def _quote_and_advance(state: ChatState, months: int | None = None) -> bool:
+    """Check availability, compute quote, then require name before confirmation."""
+    async with httpx.AsyncClient() as client:
+        if not await _check_availability(
+            client,
+            state["selected_property"],
+            state["start_date"],
+            state["end_date"],
+        ):
+            return False
+        prop_resp = await client.get(f"{_api_base()}/api/properties/{state['selected_property']}")
+        prop = prop_resp.json()
+
+    quote = _build_quote_reply(state, prop, months=months)
+    if not _is_valid_guest_name(state.get("guest_name")):
+        state["reply"] = (
+            f"{quote}\n\n"
+            f"Before I can confirm, may I have your full name please?"
+        )
+        state["current_step"] = "wait_name_before_confirm"
+        return True
+
+    state["reply"] = f"{quote}\n\nShall I confirm this booking for {state['guest_name']}? (yes/no)"
     state["current_step"] = "wait_confirm"
     return True
 
@@ -109,11 +234,14 @@ async def classify_intent(state: ChatState) -> ChatState:
         if state.get("booking_id") and step == "wait_accept_full_price":
             state["intent"] = "discount_check"
             return state
+        if step in ("wait_avail_property", "wait_avail_period"):
+            state["intent"] = "availability"
+            return state
         if step in (
-            "wait_name", "wait_property", "wait_type",
+            "ask_property", "ask_type", "wait_property", "wait_type",
             "wait_checkin", "wait_checkout",
             "wait_month_start", "wait_months_count", "wait_year_start",
-            "wait_discount_amount", "wait_confirm",
+            "wait_name_before_confirm", "wait_discount_amount", "wait_confirm",
         ):
             state["intent"] = "booking"
             return state
@@ -121,21 +249,32 @@ async def classify_intent(state: ChatState) -> ChatState:
             state["intent"] = "maintenance"
             return state
 
+    lower = state["incoming_message"].lower()
+    if any(k in lower for k in AVAILABILITY_KEYWORDS) or (
+        any(m in lower for m in MONTH_WORDS) and any(w in lower for w in ("available", "free", "book", "booked"))
+    ):
+        state["intent"] = "availability"
+        return state
+
     system_prompt = (
         "Classify the user's message into exactly one of: "
-        "booking, maintenance, discount_check, general. "
+        "booking, maintenance, discount_check, availability, general. "
+        "Use availability when asking if a property is free/available for dates or a month. "
         "Use discount_check when asking about discount approval status on an existing booking. "
         "Reply with only the single word."
     )
     result = await call_llm(system_prompt, state["incoming_message"])
     intent = result.strip().lower()
-    if intent not in ("booking", "maintenance", "discount_check", "general"):
+    if intent not in ("booking", "maintenance", "discount_check", "availability", "general"):
         intent = "general"
 
     state["intent"] = intent
 
     if intent == "booking":
-        state["current_step"] = "ask_name"
+        if state.get("selected_property"):
+            state["current_step"] = "ask_type"
+        else:
+            state["current_step"] = "ask_property"
     elif intent == "maintenance":
         state["current_step"] = "ask_unit"
 
@@ -152,29 +291,36 @@ async def _create_booking(client: httpx.AsyncClient, payload: dict):
 
 
 async def handle_booking(state: ChatState) -> ChatState:
-    step = state.get("current_step") or "ask_name"
+    step = state.get("current_step") or "ask_property"
     msg = state["incoming_message"]
     current_year = datetime.datetime.now().year
 
-    if step == "ask_name":
-        state["reply"] = "May I have your full name please?"
-        state["current_step"] = "wait_name"
-        return state
-
-    if step == "wait_name":
-        prompt = "Extract the person's full name from this message. Return ONLY the name."
-        name = await call_llm(prompt, msg)
-        state["guest_name"] = name.strip()
-
+    if step == "ask_property":
         async with httpx.AsyncClient() as client:
             props = await _fetch_properties(client)
 
         prop_list = "\n".join([f"- {p['title']} (AED {p['price_daily']}/day)" for p in props])
-        state["reply"] = (
-            f"Which property would you like, {state['guest_name']}?\n\n"
-            f"Available properties:\n{prop_list}"
-        )
+        state["reply"] = f"Which property would you like?\n\nAvailable properties:\n{prop_list}"
         state["current_step"] = "wait_property"
+        return state
+
+    if step == "ask_type":
+        async with httpx.AsyncClient() as client:
+            prop_resp = await client.get(f"{_api_base()}/api/properties/{state['selected_property']}")
+            matched = prop_resp.json() if prop_resp.status_code == 200 else None
+
+        if not matched:
+            state["current_step"] = "ask_property"
+            state["reply"] = "Which property would you like to book?"
+            return state
+
+        state["reply"] = (
+            f"Would you like a daily, monthly, or yearly rental for {matched['title']}?\n"
+            f"- Daily: AED {matched['price_daily']:g}/night\n"
+            f"- Monthly: AED {matched['price_monthly']:g}/month\n"
+            f"- Yearly: AED {matched['price_yearly']:g}/year"
+        )
+        state["current_step"] = "wait_type"
         return state
 
     if step == "wait_property":
@@ -250,9 +396,11 @@ async def handle_booking(state: ChatState) -> ChatState:
             return state
         state["end_date"] = parsed.isoformat()
         if not await _quote_and_advance(state):
+            start = datetime.date.fromisoformat(state["start_date"])
+            end = datetime.date.fromisoformat(state["end_date"])
             state["reply"] = (
-                "Sorry, this property is already booked for those dates. "
-                "When would you like to check in?"
+                f"Sorry, this property is not available from {start.isoformat()} to {end.isoformat()}. "
+                f"When would you like to check in?"
             )
             state["current_step"] = "wait_checkin"
         return state
@@ -267,8 +415,29 @@ async def handle_booking(state: ChatState) -> ChatState:
         if not parsed:
             state["reply"] = "I couldn't read that month. Please tell me a month like March 2026."
             return state
-        state["start_date"] = parsed.replace(day=1).isoformat()
-        state["reply"] = "For how many months would you like to rent?"
+        start = parsed.replace(day=1)
+        state["start_date"] = start.isoformat()
+
+        async with httpx.AsyncClient() as client:
+            prop_resp = await client.get(f"{_api_base()}/api/properties/{state['selected_property']}")
+            prop = prop_resp.json()
+            month_end = _add_months(start, 1)
+            available = await _check_availability(
+                client, state["selected_property"], start.isoformat(), month_end.isoformat()
+            )
+
+        month_name = _month_label(start)
+        if not available:
+            state["reply"] = (
+                f"Sorry, {prop['title']} is not available in {month_name}. "
+                f"Which other month would you like to try?"
+            )
+            return state
+
+        state["reply"] = (
+            f"Good news — {prop['title']} is available in {month_name}. "
+            f"For how many months would you like to rent?"
+        )
         state["current_step"] = "wait_months_count"
         return state
 
@@ -286,9 +455,10 @@ async def handle_booking(state: ChatState) -> ChatState:
         state["end_date"] = _add_months(start, months).isoformat()
         state["months_count"] = months
         if not await _quote_and_advance(state, months=months):
+            start = datetime.date.fromisoformat(state["start_date"])
             state["reply"] = (
-                "Sorry, this property is already booked for that period. "
-                "Which month would you like to start?"
+                f"Sorry, this property is not available for that {months}-month period "
+                f"starting {_month_label(start)}. Which month would you like to start?"
             )
             state["current_step"] = "wait_month_start"
         return state
@@ -308,13 +478,45 @@ async def handle_booking(state: ChatState) -> ChatState:
         state["end_date"] = _add_months(start, 12).isoformat()
         if not await _quote_and_advance(state):
             state["reply"] = (
-                "Sorry, this property isn't available for that year. "
-                "Which month would you like to start?"
+                f"Sorry, this property is not available for a year starting {_month_label(start)}. "
+                f"Which other month would you like?"
             )
             state["current_step"] = "wait_year_start"
         return state
 
+    if step == "wait_name_before_confirm":
+        name = await _extract_guest_name(msg)
+        if not _is_valid_guest_name(name):
+            state["reply"] = (
+                "I need your full name before I can confirm the booking. "
+                "Please reply with your first and last name."
+            )
+            return state
+
+        state["guest_name"] = " ".join(name.split())
+        async with httpx.AsyncClient() as client:
+            prop_resp = await client.get(f"{_api_base()}/api/properties/{state['selected_property']}")
+            prop = prop_resp.json()
+
+        months = state.get("months_count")
+        quote = _build_quote_reply(state, prop, months=months)
+        state["reply"] = (
+            f"Thank you, {state['guest_name']}.\n\n"
+            f"{quote}\n\n"
+            f"Shall I confirm this booking? (yes/no)"
+        )
+        state["current_step"] = "wait_confirm"
+        return state
+
     if step == "wait_discount_amount":
+        if not _is_valid_guest_name(state.get("guest_name")):
+            state["reply"] = (
+                "I need your full name before I can submit a discount request. "
+                "Please reply with your first and last name."
+            )
+            state["current_step"] = "wait_name_before_confirm"
+            return state
+
         prompt = "Extract the discount amount in AED from this message. Return ONLY the number."
         amount_str = await call_llm(prompt, msg)
         try:
@@ -363,10 +565,24 @@ async def handle_booking(state: ChatState) -> ChatState:
         lower = msg.lower()
         # Discount is never offered by the bot — only handled if the tenant asks.
         if any(k in lower for k in DISCOUNT_KEYWORDS):
+            if not _is_valid_guest_name(state.get("guest_name")):
+                state["reply"] = (
+                    "Before we continue, may I have your full name please?"
+                )
+                state["current_step"] = "wait_name_before_confirm"
+                return state
             state["reply"] = "Sure — how much of a discount would you like to request? (amount in AED)"
             state["current_step"] = "wait_discount_amount"
             return state
         if any(w in lower for w in ("yes", "confirm", "ok", "sure")):
+            if not _is_valid_guest_name(state.get("guest_name")):
+                state["reply"] = (
+                    "I can't confirm without your full name. "
+                    "Please reply with your first and last name."
+                )
+                state["current_step"] = "wait_name_before_confirm"
+                return state
+
             payload = {
                 "property_id": state["selected_property"],
                 "guest_name": state["guest_name"],
@@ -405,6 +621,109 @@ async def handle_booking(state: ChatState) -> ChatState:
             state["current_step"] = None
         return state
 
+    return state
+
+
+async def handle_availability(state: ChatState) -> ChatState:
+    """Answer whether a specific property is free for a month or date range."""
+    step = state.get("current_step")
+    msg = state["incoming_message"]
+    current_year = datetime.datetime.now().year
+
+    async with httpx.AsyncClient() as client:
+        props = await _fetch_properties(client)
+
+    if step == "wait_avail_property":
+        prompt = "Extract the property name or area the user is referring to. Return ONLY the name/area."
+        prop_query = await call_llm(prompt, msg)
+        matched = _match_property(props, prop_query)
+        if not matched:
+            prop_list = "\n".join([f"- {p['title']}" for p in props])
+            state["reply"] = f"I couldn't find that property. Which one?\n\n{prop_list}"
+            return state
+        state["selected_property"] = matched["id"]
+        state["reply"] = "Which month or dates should I check? (e.g. this month, March 2026)"
+        state["current_step"] = "wait_avail_period"
+        return state
+
+    if step == "wait_avail_period":
+        matched = next((p for p in props if p["id"] == state.get("selected_property")), None)
+        if not matched:
+            state["current_step"] = "wait_avail_property"
+            state["reply"] = "Which property are you asking about?"
+            return state
+        period = await _resolve_availability_period(msg, current_year)
+        if not period:
+            state["reply"] = "I couldn't read those dates. Try e.g. this month, next month, or March 2026."
+            return state
+        start, end, label = period
+        async with httpx.AsyncClient() as client:
+            available = await _check_availability(
+                client, matched["id"], start.isoformat(), end.isoformat()
+            )
+        if available:
+            state["reply"] = (
+                f"Yes — {matched['title']} is available in {label}.\n"
+                f"Say 'book' if you'd like to reserve it."
+            )
+        else:
+            state["reply"] = (
+                f"No — {matched['title']} is not available in {label}.\n"
+                f"Try another month or a different property."
+            )
+        state["intent"] = None
+        state["current_step"] = None
+        return state
+
+    # Fresh availability question
+    if state.get("selected_property"):
+        matched = next((p for p in props if p["id"] == state["selected_property"]), None)
+    else:
+        prompt = (
+            "Extract the property name or area from this message. "
+            "Return ONLY the name/area, or UNKNOWN if not mentioned."
+        )
+        prop_query = await call_llm(prompt, msg)
+        matched = _match_property(props, prop_query)
+
+    if not matched:
+        prop_list = "\n".join([f"- {p['title']}" for p in props])
+        state["reply"] = f"Which property should I check?\n\n{prop_list}"
+        state["current_step"] = "wait_avail_property"
+        state["intent"] = "availability"
+        return state
+
+    state["selected_property"] = matched["id"]
+    period = await _resolve_availability_period(msg, current_year)
+
+    if not period:
+        state["reply"] = (
+            f"Which month or dates should I check for {matched['title']}?\n"
+            f"(e.g. this month, next month, March 2026)"
+        )
+        state["current_step"] = "wait_avail_period"
+        state["intent"] = "availability"
+        return state
+
+    start, end, label = period
+    async with httpx.AsyncClient() as client:
+        available = await _check_availability(
+            client, matched["id"], start.isoformat(), end.isoformat()
+        )
+
+    if available:
+        state["reply"] = (
+            f"Yes — {matched['title']} is available in {label}.\n"
+            f"Say 'book' if you'd like to reserve it."
+        )
+    else:
+        state["reply"] = (
+            f"No — {matched['title']} is not available in {label}.\n"
+            f"Try another month or ask about a different property."
+        )
+
+    state["intent"] = None
+    state["current_step"] = None
     return state
 
 
@@ -562,8 +881,9 @@ async def handle_discount_check(state: ChatState) -> ChatState:
 async def handle_general(state: ChatState) -> ChatState:
     system_prompt = (
         "You are a friendly web assistant for a UAE property booking platform. "
-        "Answer briefly and helpfully. If relevant, invite the user to book a property "
-        "or report a maintenance issue."
+        "Answer briefly and helpfully. Do NOT guess whether a property is available — "
+        "tell the user to ask e.g. 'Is Marina View available this month?' and you will check. "
+        "If relevant, invite the user to book a property or report a maintenance issue."
     )
     state["reply"] = await call_llm(system_prompt, state["incoming_message"])
     state["intent"] = None
@@ -579,6 +899,7 @@ def build_graph():
     graph.add_node("classify_intent", classify_intent)
     graph.add_node("booking", handle_booking)
     graph.add_node("maintenance", handle_maintenance)
+    graph.add_node("availability", handle_availability)
     graph.add_node("discount_check", handle_discount_check)
     graph.add_node("general", handle_general)
 
@@ -589,12 +910,14 @@ def build_graph():
         {
             "booking": "booking",
             "maintenance": "maintenance",
+            "availability": "availability",
             "discount_check": "discount_check",
             "general": "general",
         },
     )
     graph.add_edge("booking", END)
     graph.add_edge("maintenance", END)
+    graph.add_edge("availability", END)
     graph.add_edge("discount_check", END)
     graph.add_edge("general", END)
 

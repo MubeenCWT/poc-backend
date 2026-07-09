@@ -4,7 +4,7 @@ class ChatState(TypedDict, total=False):
     session_id: str
     phone: str
     incoming_message: str
-    intent: Optional[str]  # booking, maintenance, discount_check, general
+    intent: Optional[str]  # booking, maintenance, discount_check, availability, general
     reply: Optional[str]
 
     # multi-step flow

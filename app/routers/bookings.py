@@ -68,6 +68,10 @@ async def create_booking(
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ):
+    guest_name = " ".join((payload.guest_name or "").strip().split())
+    if len(guest_name) < 2 or not any(c.isalpha() for c in guest_name):
+        raise HTTPException(status_code=400, detail="A valid guest full name is required before booking.")
+
     if payload.end_date < payload.start_date:
         raise HTTPException(status_code=400, detail="end_date cannot be before start_date")
 
@@ -82,7 +86,7 @@ async def create_booking(
 
     booking = Booking(
         property_id=payload.property_id,
-        guest_name=payload.guest_name,
+        guest_name=guest_name,
         guest_phone=payload.guest_phone,
         booking_type=payload.booking_type,
         start_date=payload.start_date,
