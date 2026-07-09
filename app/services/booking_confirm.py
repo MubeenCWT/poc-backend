@@ -1,0 +1,71 @@
+"""Shared booking confirmation helpers for the API and admin WhatsApp commands."""
+from sqlalchemy.orm import Session
+
+from app.models.models import Booking, Property, AdminNotification
+
+
+def admin_payment_verification_message(booking: Booking, prop: Property | None) -> str:
+    ref = booking.id[:8].upper()
+    total = booking.final_price if booking.final_price is not None else booking.base_price
+    title = prop.title if prop else booking.property_id
+    return (
+        f"Booking pending payment:\n"
+        f"Property: {title}\n"
+        f"Guest: {booking.guest_name} ({booking.guest_phone})\n"
+        f"Dates: {booking.start_date} to {booking.end_date}\n"
+        f"Total: AED {total}\n\n"
+        f"Have you received payment?\n"
+        f"Confirm in the admin portal, or reply:\n"
+        f"  CONFIRM {ref}"
+    )
+
+
+def tenant_pending_payment_message(booking: Booking, prop: Property | None) -> str:
+    ref = booking.id[:8].upper()
+    total = booking.final_price if booking.final_price is not None else booking.base_price
+    title = prop.title if prop else "your stay"
+    return (
+        f"Thanks, {booking.guest_name}!\n"
+        f"Your booking for {title} is reserved.\n"
+        f"Reference: {ref}\n"
+        f"Dates: {booking.start_date} to {booking.end_date}\n"
+        f"Total: AED {total}\n\n"
+        f"We'll confirm your booking once payment is received."
+    )
+
+
+def tenant_confirmed_message(booking: Booking, prop: Property | None) -> str:
+    ref = booking.id[:8].upper()
+    title = prop.title if prop else "your stay"
+    return (
+        f"Your booking is confirmed!\n"
+        f"Reference: {ref}\n"
+        f"Property: {title}\n"
+        f"Dates: {booking.start_date} to {booking.end_date}\n"
+        f"Total: AED {booking.final_price}\n\n"
+        f"See you soon!"
+    )
+
+
+def finalize_booking_confirmation(db: Session, booking: Booking) -> str:
+    """Mark booking confirmed and return the message to send to the tenant."""
+    if booking.status == "confirmed":
+        prop = db.query(Property).filter(Property.id == booking.property_id).first()
+        return tenant_confirmed_message(booking, prop)
+
+    booking.status = "confirmed"
+    if booking.final_price is None:
+        booking.final_price = booking.base_price
+
+    prop = db.query(Property).filter(Property.id == booking.property_id).first()
+    log = (
+        f"Booking confirmed:\n"
+        f"Property: {prop.title if prop else booking.property_id}\n"
+        f"Guest: {booking.guest_name}\n"
+        f"Dates: {booking.start_date} to {booking.end_date}\n"
+        f"Total: AED {booking.final_price}"
+    )
+    db.add(AdminNotification(type="booking_confirmed", reference_id=booking.id, message=log))
+    db.commit()
+    db.refresh(booking)
+    return tenant_confirmed_message(booking, prop)

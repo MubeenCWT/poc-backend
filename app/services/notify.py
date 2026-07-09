@@ -59,7 +59,7 @@ async def send_whatsapp_text(to: str, body: str) -> bool:
         return False
 
 
-async def send_admin_alert(message: str, title: str = "DAR Alert") -> bool:
+async def send_admin_alert(message: str, title: str = "Booking Alert") -> bool:
     """Send a one-way WhatsApp alert to the admin number."""
     if not settings.ADMIN_WHATSAPP_NUMBER:
         logger.warning("ADMIN_WHATSAPP_NUMBER not set — skipping alert: %s", message[:80])

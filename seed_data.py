@@ -12,7 +12,7 @@ def run_seed():
         if not admin:
             admin = User(
                 role="admin",
-                full_name="DAR Admin",
+                full_name="UAE Stays Admin",
                 email="admin@dar.ae",
                 password_hash=hash_password("admin123"),
             )

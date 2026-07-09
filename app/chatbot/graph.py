@@ -388,20 +388,13 @@ async def handle_booking(state: ChatState) -> ChatState:
                     return state
 
                 booking = resp.json()
-                confirm_resp = await client.post(
-                    f"{_api_base()}/api/bookings/{booking['id']}/guest-confirm"
-                )
-
-            if confirm_resp.status_code != 200:
-                state["reply"] = "Booking was created but confirmation failed. Please contact support."
-            else:
-                confirmed = confirm_resp.json()
-                state["booking_id"] = confirmed["id"]
+                state["booking_id"] = booking["id"]
                 state["reply"] = (
-                    f"Booking confirmed!\n"
-                    f"Reference: {confirmed['id'][:8].upper()}\n"
-                    f"Dates: {confirmed['start_date']} to {confirmed['end_date']}\n"
-                    f"Total: AED {confirmed['final_price']}\n\n"
+                    f"Your booking is reserved!\n"
+                    f"Reference: {booking['id'][:8].upper()}\n"
+                    f"Dates: {booking['start_date']} to {booking['end_date']}\n"
+                    f"Total: AED {booking['base_price']}\n\n"
+                    f"We'll confirm once payment is received. "
                     f"Please transfer the amount to complete your stay."
                 )
             state["intent"] = None
@@ -493,14 +486,14 @@ async def handle_discount_check(state: ChatState) -> ChatState:
             async with httpx.AsyncClient() as client:
                 resp = await client.post(f"{_api_base()}/api/bookings/{booking_id}/guest-confirm")
             if resp.status_code != 200:
-                state["reply"] = "Could not confirm the booking. Please try again or contact support."
+                state["reply"] = "Could not reserve the booking. Please try again or contact support."
             else:
                 booking = resp.json()
                 state["reply"] = (
-                    f"Booking confirmed at full price!\n"
+                    f"Thanks! Your booking at full price is reserved.\n"
                     f"Reference: {booking['id'][:8].upper()}\n"
-                    f"Total: AED {booking['final_price']}\n\n"
-                    f"Please transfer the amount to complete your stay."
+                    f"Total: AED {booking['final_price'] or booking['base_price']}\n\n"
+                    f"We'll confirm once payment is received."
                 )
             state["current_step"] = None
             state["intent"] = None

@@ -9,6 +9,10 @@ from app.schemas.schemas import BookingCreate, BookingOut, DiscountDecision
 from app.services.deps import get_current_admin
 from app.services.notify import send_admin_alert, send_whatsapp_text
 from app.services.discounts import apply_discount_decision
+from app.services.booking_confirm import (
+    admin_payment_verification_message,
+    finalize_booking_confirmation,
+)
 
 router = APIRouter(prefix="/bookings", tags=["bookings"])
 
@@ -111,23 +115,25 @@ async def create_booking(
         )
         db.add(discount_req)
 
-    notification_text = (
-        f"New booking request:\n"
-        f"Property: {prop.title}\n"
-        f"Guest: {payload.guest_name} ({payload.guest_phone})\n"
-        f"Dates: {payload.start_date} to {payload.end_date}\n"
-        f"Type: {payload.booking_type}, Base price: AED {base_price}"
-    )
     if payload.discount_requested:
         ref = booking.id[:8].upper()
-        notification_text += (
-            f"\nDiscount requested: AED {payload.discount_amount}."
+        notification_text = (
+            f"New booking with discount request:\n"
+            f"Property: {prop.title}\n"
+            f"Guest: {payload.guest_name} ({payload.guest_phone})\n"
+            f"Dates: {payload.start_date} to {payload.end_date}\n"
+            f"Type: {payload.booking_type}, Base price: AED {base_price}\n"
+            f"Discount requested: AED {payload.discount_amount}."
             f"\n\nReply here to decide:"
             f"\n  APPROVE {ref}"
             f"\n  REJECT {ref}"
         )
+        notif_type = "new_booking"
+    else:
+        notification_text = admin_payment_verification_message(booking, prop)
+        notif_type = "payment_pending"
 
-    db.add(AdminNotification(type="new_booking", reference_id=booking.id, message=notification_text))
+    db.add(AdminNotification(type=notif_type, reference_id=booking.id, message=notification_text))
     db.commit()
     db.refresh(booking)
 
@@ -162,23 +168,11 @@ async def confirm_booking(
     if booking.status == "confirmed":
         return booking
 
-    booking.status = "confirmed"
-    if booking.final_price is None:
-        booking.final_price = booking.base_price
+    tenant_msg = finalize_booking_confirmation(db, booking)
 
-    prop = db.query(Property).filter(Property.id == booking.property_id).first()
-    message = (
-        f"Booking confirmed:\n"
-        f"Property: {prop.title if prop else booking.property_id}\n"
-        f"Guest: {booking.guest_name}\n"
-        f"Dates: {booking.start_date} to {booking.end_date}\n"
-        f"Total: AED {booking.final_price}"
-    )
-    db.add(AdminNotification(type="booking_confirmed", reference_id=booking.id, message=message))
-    db.commit()
-    db.refresh(booking)
+    if booking.guest_phone and booking.guest_phone != "web":
+        background_tasks.add_task(_push_text, booking.guest_phone, tenant_msg)
 
-    background_tasks.add_task(_push_alert, message)
     return booking
 
 
@@ -188,7 +182,7 @@ async def guest_confirm_booking(
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ):
-    """Guest accepts full price after a rejected discount — confirms a pending booking."""
+    """Guest accepts full price after a rejected discount — awaits admin payment confirmation."""
     booking = db.query(Booking).filter(Booking.id == booking_id).first()
     if not booking:
         raise HTTPException(404, "Booking not found")
@@ -197,22 +191,15 @@ async def guest_confirm_booking(
     if booking.status != "pending":
         raise HTTPException(400, detail="Booking cannot be confirmed in its current state")
 
-    booking.status = "confirmed"
     booking.final_price = booking.base_price
-
     prop = db.query(Property).filter(Property.id == booking.property_id).first()
-    message = (
-        f"Guest confirmed at full price:\n"
-        f"Property: {prop.title if prop else booking.property_id}\n"
-        f"Guest: {booking.guest_name}\n"
-        f"Dates: {booking.start_date} to {booking.end_date}\n"
-        f"Total: AED {booking.final_price}"
-    )
-    db.add(AdminNotification(type="booking_confirmed", reference_id=booking.id, message=message))
+
+    admin_msg = admin_payment_verification_message(booking, prop)
+    db.add(AdminNotification(type="payment_pending", reference_id=booking.id, message=admin_msg))
     db.commit()
     db.refresh(booking)
 
-    background_tasks.add_task(_push_alert, message)
+    background_tasks.add_task(_push_alert, admin_msg)
     return booking
 
 
