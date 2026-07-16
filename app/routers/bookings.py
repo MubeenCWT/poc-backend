@@ -8,7 +8,7 @@ from app.models.models import Booking, Property, PropertyAvailability, DiscountR
 from app.schemas.schemas import BookingCreate, BookingOut, DiscountDecision, CounterResponse
 from app.services.deps import get_current_admin
 from app.services.notify import send_admin_alert, send_whatsapp_text, send_whatsapp_buttons
-from app.services.discounts import apply_discount_decision, apply_discount_counter, apply_counter_response
+from app.services.discounts import apply_discount_decision, apply_discount_counter, apply_counter_response, admin_counter_result_alert
 from app.services.booking_confirm import (
     admin_payment_verification_message,
     admin_payment_buttons,
@@ -267,6 +267,7 @@ async def decide_discount(
 async def respond_to_counter(
     booking_id: str,
     payload: CounterResponse,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ):
     """Tenant accepts or declines an admin counter-offer."""
@@ -277,4 +278,9 @@ async def respond_to_counter(
         raise HTTPException(400, "No counter-offer awaiting a response")
 
     apply_counter_response(db, booking, payload.accept)
+    prop = db.query(Property).filter(Property.id == booking.property_id).first()
+    admin_msg = admin_counter_result_alert(booking, payload.accept, prop)
+    title = "Booking Confirmed" if payload.accept else "Booking Cancelled"
+    background_tasks.add_task(_push_alert, admin_msg, None, title)
+
     return booking

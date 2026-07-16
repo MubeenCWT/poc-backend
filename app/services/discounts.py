@@ -148,7 +148,10 @@ def apply_counter_response(
     booking: Booking,
     accept: bool,
 ) -> str:
-    """Tenant accepts or declines an admin counter-offer."""
+    """Tenant accepts or declines an admin counter-offer.
+
+    Returns the message to send to the tenant.
+    """
     discount_req = (
         db.query(DiscountRequest)
         .filter(DiscountRequest.booking_id == booking.id)
@@ -167,6 +170,20 @@ def apply_counter_response(
         if discount_req:
             discount_req.status = "approved"
             discount_req.decided_at = datetime.datetime.utcnow()
+        from app.models.models import AdminNotification
+        db.add(AdminNotification(
+            type="booking_confirmed",
+            reference_id=booking.id,
+            message=(
+                f"Booking confirmed (counter-offer accepted):\n"
+                f"Property: {title}\n"
+                f"Guest: {booking.guest_name} ({booking.guest_phone})\n"
+                f"Dates: {booking.start_date} to {booking.end_date}\n"
+                f"Total: AED {booking.final_price} "
+                f"(AED {counter:g} off base AED {booking.base_price})\n"
+                f"Ref: {ref}"
+            ),
+        ))
         msg = (
             f"Perfect — offer accepted!\n"
             f"Booking {ref} for {title} is CONFIRMED.\n"
@@ -181,11 +198,19 @@ def apply_counter_response(
         if discount_req:
             discount_req.status = "rejected"
             discount_req.decided_at = datetime.datetime.utcnow()
-        # Free the held dates
-        from app.models.models import PropertyAvailability
+        from app.models.models import PropertyAvailability, AdminNotification
         db.query(PropertyAvailability).filter(
             PropertyAvailability.booking_id == booking.id
         ).delete(synchronize_session=False)
+        db.add(AdminNotification(
+            type="booking_cancelled",
+            reference_id=booking.id,
+            message=(
+                f"Tenant declined counter-offer — booking {ref} cancelled.\n"
+                f"Property: {title}\n"
+                f"Guest: {booking.guest_name}"
+            ),
+        ))
         msg = (
             f"No problem — we've cancelled booking {ref} for {title}.\n"
             f"Your dates are released. Message us anytime to book again."
@@ -194,3 +219,25 @@ def apply_counter_response(
     db.commit()
     db.refresh(booking)
     return msg
+
+
+def admin_counter_result_alert(booking: Booking, accept: bool, prop: Property | None = None) -> str:
+    """Full alert text for admin after tenant accepts/declines a counter-offer."""
+    title = prop.title if prop else booking.property_id
+    ref = booking.id[:8].upper()
+    if accept:
+        return (
+            f"Booking confirmed — tenant accepted your counter-offer.\n"
+            f"Property: {title}\n"
+            f"Guest: {booking.guest_name} ({booking.guest_phone})\n"
+            f"Dates: {booking.start_date} to {booking.end_date}\n"
+            f"Total: AED {booking.final_price}\n"
+            f"(AED {booking.discount_amount} off base AED {booking.base_price})\n"
+            f"Ref: {ref}"
+        )
+    return (
+        f"Tenant declined your counter-offer — booking cancelled.\n"
+        f"Property: {title}\n"
+        f"Guest: {booking.guest_name}\n"
+        f"Ref: {ref}"
+    )

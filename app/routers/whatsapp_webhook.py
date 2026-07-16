@@ -20,6 +20,7 @@ from app.services.discounts import (
     apply_discount_decision,
     apply_discount_counter,
     apply_counter_response,
+    admin_counter_result_alert,
 )
 from app.services.booking_confirm import (
     finalize_booking_confirmation,
@@ -27,7 +28,7 @@ from app.services.booking_confirm import (
     tenant_full_price_buttons,
     admin_payment_buttons,
 )
-from app.services.notify import send_whatsapp_text, send_whatsapp_buttons
+from app.services.notify import send_whatsapp_text, send_whatsapp_buttons, send_admin_alert
 
 logger = logging.getLogger(__name__)
 
@@ -201,21 +202,18 @@ async def _handle_button_id(button_id: str, db) -> bool:
                 "This offer is no longer available.",
             )
             return True
-        tenant_msg = apply_counter_response(db, booking, accept=(action == "yes"))
+        accept = action == "yes"
+        tenant_msg = apply_counter_response(db, booking, accept=accept)
         if booking.guest_phone and booking.guest_phone != "web":
             await send_whatsapp_text(booking.guest_phone, tenant_msg)
-        if admin_number:
-            result = "accepted" if action == "yes" else "declined"
-            await send_whatsapp_text(
-                admin_number,
-                f"Tenant {result} your counter-offer on booking {booking.id[:8].upper()}.",
-            )
-            if action == "yes":
-                # Still ask about payment with buttons
-                from app.models.models import Property
-                prop = db.query(Property).filter(Property.id == booking.property_id).first()
-                # Booking already confirmed on accept — no further payment gate needed
-                # (matches approve path). Optional payment reminder left as message only.
+
+        from app.models.models import Property
+        prop = db.query(Property).filter(Property.id == booking.property_id).first()
+        admin_msg = admin_counter_result_alert(booking, accept, prop)
+        await send_admin_alert(
+            admin_msg,
+            title="Booking Confirmed" if accept else "Booking Cancelled",
+        )
         return True
 
     # Tenant: full_yes_ / full_no_
