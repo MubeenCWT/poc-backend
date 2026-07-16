@@ -202,6 +202,7 @@ async def _try_flexible_booking_redirect(state: ChatState, msg: str) -> bool:
         state["start_date"] = None
         state["end_date"] = None
         state["booking_type"] = None
+        state["guest_name"] = None
         return True
 
     # Detect inquire / switch property even while waiting for dates etc.
@@ -287,7 +288,8 @@ def _is_valid_guest_name(name: str | None) -> bool:
     cleaned = " ".join(name.strip().split())
     if len(cleaned) < 2:
         return False
-    if cleaned.lower() in _INVALID_NAME_WORDS:
+    lower = cleaned.lower()
+    if lower in _INVALID_NAME_WORDS or lower == "unknown":
         return False
     if cleaned.isdigit():
         return False
@@ -297,9 +299,14 @@ def _is_valid_guest_name(name: str | None) -> bool:
 async def _extract_guest_name(msg: str) -> str:
     prompt = (
         "Extract the person's full name from this message. "
-        "Return ONLY the name. If no real name is given, return UNKNOWN."
+        "Return ONLY the first and last name if clearly provided as the user's own name. "
+        "If the message is a yes/no, a date, a place, a property, or anything that is not "
+        "clearly a personal name being given, return UNKNOWN."
     )
-    return (await call_llm(prompt, msg)).strip()
+    raw = (await call_llm(prompt, msg)).strip()
+    if not raw or raw.upper() == "UNKNOWN" or "unknown" in raw.lower():
+        return "UNKNOWN"
+    return raw
 
 
 def _build_quote_reply(state: ChatState, prop: dict, months: int | None = None) -> str:
@@ -332,7 +339,7 @@ def _build_quote_reply(state: ChatState, prop: dict, months: int | None = None) 
 
 
 async def _quote_and_advance(state: ChatState, months: int | None = None) -> bool:
-    """Check availability, compute quote, then require name before confirmation."""
+    """Check availability, compute quote, then ALWAYS ask for name before confirmation."""
     async with httpx.AsyncClient() as client:
         if not await _check_availability(
             client,
@@ -345,16 +352,13 @@ async def _quote_and_advance(state: ChatState, months: int | None = None) -> boo
         prop = prop_resp.json()
 
     quote = _build_quote_reply(state, prop, months=months)
-    if not _is_valid_guest_name(state.get("guest_name")):
-        state["reply"] = (
-            f"{quote}\n\n"
-            f"Before I can confirm, may I have your full name please?"
-        )
-        state["current_step"] = "wait_name_before_confirm"
-        return True
-
-    state["reply"] = f"{quote}\n\nShall I confirm this booking for {state['guest_name']}? (yes/no)"
-    state["current_step"] = "wait_confirm"
+    # Strict rule: always collect name for THIS booking — never reuse a stale session name.
+    state["guest_name"] = None
+    state["reply"] = (
+        f"{quote}\n\n"
+        f"Before I can confirm, may I have your full name please?"
+    )
+    state["current_step"] = "wait_name_before_confirm"
     return True
 
 
@@ -421,6 +425,10 @@ async def classify_intent(state: ChatState) -> ChatState:
     state["intent"] = intent
 
     if intent == "booking":
+        # Fresh booking — don't carry over an old name/dates from this WhatsApp session
+        state["guest_name"] = None
+        state["booking_id"] = None
+        state["quote_amount"] = None
         if state.get("selected_property"):
             state["current_step"] = "ask_type"
         else:

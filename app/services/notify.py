@@ -122,11 +122,25 @@ async def send_admin_alert(
     title: str = "Booking Alert",
     buttons: Optional[List[Dict[str, str]]] = None,
 ) -> bool:
-    """Send a WhatsApp alert to the admin number, optionally with reply buttons."""
+    """Send a WhatsApp alert to the admin number.
+
+    Always sends plain text first (reliable). Then tries reply buttons as a
+    follow-up so admin can tap Approve/Reject/Confirm without typing a ref.
+    """
     if not settings.ADMIN_WHATSAPP_NUMBER:
         logger.warning("ADMIN_WHATSAPP_NUMBER not set — skipping alert: %s", message[:80])
         return False
+
     body = f"*{title}*\n\n{message}"
+    # Plain text first — interactive buttons can fail on some Meta test setups
+    text_ok = await send_whatsapp_text(settings.ADMIN_WHATSAPP_NUMBER, body)
+    if not text_ok:
+        logger.error("Failed to send admin text alert: %s", message[:120])
+        return False
+
     if buttons:
-        return await send_whatsapp_buttons(settings.ADMIN_WHATSAPP_NUMBER, body, buttons)
-    return await send_whatsapp_text(settings.ADMIN_WHATSAPP_NUMBER, body)
+        btn_body = "Quick actions for the alert above:"
+        btn_ok = await send_whatsapp_buttons(settings.ADMIN_WHATSAPP_NUMBER, btn_body, buttons)
+        if not btn_ok:
+            logger.warning("Admin alert text sent, but buttons failed — admin can still reply with text commands.")
+    return True
