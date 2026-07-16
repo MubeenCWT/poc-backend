@@ -1,11 +1,10 @@
 """
 Shared discount-decision logic used by both the admin web portal and the
-two-way WhatsApp webhook (admin can approve/reject straight from WhatsApp).
+two-way WhatsApp webhook.
 
-`apply_discount_decision` mutates the DB (booking + discount request), and on a
-rejection it primes the tenant's chatbot session so a plain "yes" reply confirms
-the booking at full price. It returns the message that should be sent to the
-TENANT — the caller is responsible for actually delivering it over WhatsApp.
+Supports:
+  - approve / reject the requested discount
+  - counter-offer a different amount (tenant must accept or decline)
 """
 import datetime
 
@@ -17,6 +16,25 @@ from app.models.models import Booking, DiscountRequest, Property, ChatbotSession
 def _tenant_session_id(booking: Booking) -> str | None:
     phone = "".join(ch for ch in (booking.guest_phone or "") if ch.isdigit())
     return f"wa_{phone}" if phone else None
+
+
+def _prime_tenant_session(db: Session, booking: Booking, step: str, extra: dict | None = None) -> None:
+    session_id = _tenant_session_id(booking)
+    if not session_id:
+        return
+    session = db.query(ChatbotSession).filter(ChatbotSession.id == session_id).first()
+    if not session:
+        session = ChatbotSession(id=session_id, phone=booking.guest_phone, state={})
+        db.add(session)
+        db.flush()
+    new_state = dict(session.state or {})
+    new_state["booking_id"] = booking.id
+    new_state["current_step"] = step
+    new_state["intent"] = "discount_check"
+    if extra:
+        new_state.update(extra)
+    session.state = new_state
+    session.last_intent = "discount_check"
 
 
 def apply_discount_decision(
@@ -61,23 +79,9 @@ def apply_discount_decision(
             f"Update on your booking {ref} for {title}:\n"
             f"Unfortunately the requested discount could not be approved.\n"
             f"The full price is AED {booking.base_price}.\n"
-            f"Reply 'yes' to confirm at full price and keep your dates reserved."
+            f"Would you like to continue at full price?"
         )
-        # Prime the tenant's WhatsApp session so a plain "yes" confirms at full price.
-        session_id = _tenant_session_id(booking)
-        if session_id:
-            session = (
-                db.query(ChatbotSession)
-                .filter(ChatbotSession.id == session_id)
-                .first()
-            )
-            if session:
-                new_state = dict(session.state or {})
-                new_state["booking_id"] = booking.id
-                new_state["current_step"] = "wait_accept_full_price"
-                new_state["intent"] = "discount_check"
-                session.state = new_state
-                session.last_intent = "discount_check"
+        _prime_tenant_session(db, booking, "wait_accept_full_price")
 
     if discount_req:
         discount_req.decided_by = decided_by
@@ -86,3 +90,107 @@ def apply_discount_decision(
     db.commit()
     db.refresh(booking)
     return tenant_msg
+
+
+def apply_discount_counter(
+    db: Session,
+    booking: Booking,
+    counter_amount: float,
+    decided_by: str | None = None,
+) -> str:
+    """Admin offers a different discount. Tenant must accept or decline.
+
+    Returns the message to send to the tenant.
+    """
+    if counter_amount <= 0:
+        raise ValueError("Counter amount must be greater than 0")
+    if counter_amount >= float(booking.base_price):
+        raise ValueError("Counter amount must be less than the base price")
+
+    discount_req = (
+        db.query(DiscountRequest)
+        .filter(DiscountRequest.booking_id == booking.id)
+        .first()
+    )
+    prop = db.query(Property).filter(Property.id == booking.property_id).first()
+    title = prop.title if prop else booking.property_id
+    ref = booking.id[:8].upper()
+    new_total = float(booking.base_price) - float(counter_amount)
+
+    booking.discount_status = "countered"
+    if discount_req:
+        discount_req.status = "countered"
+        discount_req.counter_amount = counter_amount
+        discount_req.decided_by = decided_by
+        discount_req.decided_at = datetime.datetime.utcnow()
+
+    _prime_tenant_session(
+        db,
+        booking,
+        "wait_counter_response",
+        {"counter_amount": float(counter_amount)},
+    )
+
+    db.commit()
+    db.refresh(booking)
+
+    return (
+        f"Update on your booking {ref} for {title}:\n"
+        f"You asked for AED {booking.discount_amount} off.\n"
+        f"We can offer AED {counter_amount:g} off instead "
+        f"(new total: AED {new_total:g}).\n\n"
+        f"Would you like to accept this offer?"
+    )
+
+
+def apply_counter_response(
+    db: Session,
+    booking: Booking,
+    accept: bool,
+) -> str:
+    """Tenant accepts or declines an admin counter-offer."""
+    discount_req = (
+        db.query(DiscountRequest)
+        .filter(DiscountRequest.booking_id == booking.id)
+        .first()
+    )
+    prop = db.query(Property).filter(Property.id == booking.property_id).first()
+    title = prop.title if prop else booking.property_id
+    ref = booking.id[:8].upper()
+    counter = float(discount_req.counter_amount) if discount_req and discount_req.counter_amount else 0
+
+    if accept:
+        booking.discount_amount = counter
+        booking.discount_status = "approved"
+        booking.final_price = float(booking.base_price) - counter
+        booking.status = "confirmed"
+        if discount_req:
+            discount_req.status = "approved"
+            discount_req.decided_at = datetime.datetime.utcnow()
+        msg = (
+            f"Perfect — offer accepted!\n"
+            f"Booking {ref} for {title} is CONFIRMED.\n"
+            f"Dates: {booking.start_date} to {booking.end_date}\n"
+            f"Total: AED {booking.final_price} (AED {counter:g} off).\n"
+            f"Please proceed with payment to complete your stay."
+        )
+    else:
+        booking.discount_status = "rejected"
+        booking.final_price = None
+        booking.status = "cancelled"
+        if discount_req:
+            discount_req.status = "rejected"
+            discount_req.decided_at = datetime.datetime.utcnow()
+        # Free the held dates
+        from app.models.models import PropertyAvailability
+        db.query(PropertyAvailability).filter(
+            PropertyAvailability.booking_id == booking.id
+        ).delete(synchronize_session=False)
+        msg = (
+            f"No problem — we've cancelled booking {ref} for {title}.\n"
+            f"Your dates are released. Message us anytime to book again."
+        )
+
+    db.commit()
+    db.refresh(booking)
+    return msg

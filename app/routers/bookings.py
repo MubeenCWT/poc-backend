@@ -5,12 +5,16 @@ from sqlalchemy import and_
 
 from app.database import get_db
 from app.models.models import Booking, Property, PropertyAvailability, DiscountRequest, User, AdminNotification
-from app.schemas.schemas import BookingCreate, BookingOut, DiscountDecision
+from app.schemas.schemas import BookingCreate, BookingOut, DiscountDecision, CounterResponse
 from app.services.deps import get_current_admin
-from app.services.notify import send_admin_alert, send_whatsapp_text
-from app.services.discounts import apply_discount_decision
+from app.services.notify import send_admin_alert, send_whatsapp_text, send_whatsapp_buttons
+from app.services.discounts import apply_discount_decision, apply_discount_counter, apply_counter_response
 from app.services.booking_confirm import (
     admin_payment_verification_message,
+    admin_payment_buttons,
+    admin_discount_buttons,
+    tenant_full_price_buttons,
+    tenant_counter_buttons,
     finalize_booking_confirmation,
 )
 
@@ -47,12 +51,15 @@ def _has_conflict(db: Session, property_id: str, start_date, end_date) -> bool:
     return overlap is not None
 
 
-async def _push_alert(message: str):
-    await send_admin_alert(message)
+async def _push_alert(message: str, buttons=None, title: str = "Booking Alert"):
+    await send_admin_alert(message, title=title, buttons=buttons)
 
 
-async def _push_text(to: str, message: str):
-    await send_whatsapp_text(to, message)
+async def _push_text(to: str, message: str, buttons=None):
+    if buttons:
+        await send_whatsapp_buttons(to, message, buttons)
+    else:
+        await send_whatsapp_text(to, message)
 
 
 @router.get("/check-availability")
@@ -127,21 +134,22 @@ async def create_booking(
             f"Guest: {payload.guest_name} ({payload.guest_phone})\n"
             f"Dates: {payload.start_date} to {payload.end_date}\n"
             f"Type: {payload.booking_type}, Base price: AED {base_price}\n"
-            f"Discount requested: AED {payload.discount_amount}."
-            f"\n\nReply here to decide:"
-            f"\n  APPROVE {ref}"
-            f"\n  REJECT {ref}"
+            f"Discount requested: AED {payload.discount_amount}.\n"
+            f"Ref: {ref}\n\n"
+            f"Tap a button, or reply APPROVE / REJECT / OFFER {ref} <amount>"
         )
         notif_type = "new_booking"
+        buttons = admin_discount_buttons(booking)
     else:
         notification_text = admin_payment_verification_message(booking, prop)
         notif_type = "payment_pending"
+        buttons = admin_payment_buttons(booking)
 
     db.add(AdminNotification(type=notif_type, reference_id=booking.id, message=notification_text))
     db.commit()
     db.refresh(booking)
 
-    background_tasks.add_task(_push_alert, notification_text)
+    background_tasks.add_task(_push_alert, notification_text, buttons)
 
     return booking
 
@@ -203,7 +211,7 @@ async def guest_confirm_booking(
     db.commit()
     db.refresh(booking)
 
-    background_tasks.add_task(_push_alert, admin_msg)
+    background_tasks.add_task(_push_alert, admin_msg, admin_payment_buttons(booking))
     return booking
 
 
@@ -218,20 +226,55 @@ async def decide_discount(
     booking = db.query(Booking).filter(Booking.id == booking_id).first()
     if not booking:
         raise HTTPException(404, "Booking not found")
+    if booking.discount_status != "pending":
+        raise HTTPException(400, "No pending discount decision for this booking")
 
-    tenant_msg = apply_discount_decision(db, booking, decision.approve, decided_by=admin.id)
+    buttons = None
+    if decision.counter_amount is not None:
+        try:
+            tenant_msg = apply_discount_counter(
+                db, booking, float(decision.counter_amount), decided_by=admin.id
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        notif_type = "discount_countered"
+        log = (
+            f"Counter-offer AED {decision.counter_amount} sent for booking "
+            f"{booking.id[:8].upper()} — waiting on tenant."
+        )
+        buttons = tenant_counter_buttons(booking)
+    else:
+        tenant_msg = apply_discount_decision(db, booking, decision.approve, decided_by=admin.id)
+        notif_type = "discount_approved" if decision.approve else "discount_rejected"
+        log = (
+            f"Discount {'approved' if decision.approve else 'rejected'} for booking "
+            f"{booking.id[:8].upper()} — tenant notified."
+        )
+        if not decision.approve:
+            buttons = tenant_full_price_buttons(booking)
 
-    notif_type = "discount_approved" if decision.approve else "discount_rejected"
-    log = (
-        f"Discount {'approved' if decision.approve else 'rejected'} for booking "
-        f"{booking.id[:8].upper()} — tenant notified."
-    )
     db.add(AdminNotification(type=notif_type, reference_id=booking.id, message=log))
     db.commit()
     db.refresh(booking)
 
-    # The decision message goes to the TENANT, not the admin.
     if booking.guest_phone and booking.guest_phone != "web":
-        background_tasks.add_task(_push_text, booking.guest_phone, tenant_msg)
+        background_tasks.add_task(_push_text, booking.guest_phone, tenant_msg, buttons)
 
+    return booking
+
+
+@router.post("/{booking_id}/counter-response", response_model=BookingOut)
+async def respond_to_counter(
+    booking_id: str,
+    payload: CounterResponse,
+    db: Session = Depends(get_db),
+):
+    """Tenant accepts or declines an admin counter-offer."""
+    booking = db.query(Booking).filter(Booking.id == booking_id).first()
+    if not booking:
+        raise HTTPException(404, "Booking not found")
+    if booking.discount_status != "countered":
+        raise HTTPException(400, "No counter-offer awaiting a response")
+
+    apply_counter_response(db, booking, payload.accept)
     return booking

@@ -76,7 +76,7 @@ class Booking(Base):
     base_price = Column(Numeric(10, 2), nullable=False)
     discount_requested = Column(Boolean, default=False)
     discount_amount = Column(Numeric(10, 2), default=0)
-    discount_status = Column(String(20), default="none")  # none, pending, approved, rejected
+    discount_status = Column(String(20), default="none")  # none, pending, approved, rejected, countered
     final_price = Column(Numeric(10, 2))
     status = Column(String(20), default="pending")  # pending, confirmed, cancelled, completed
     source = Column(String(20), default="chatbot")
@@ -114,8 +114,9 @@ class DiscountRequest(Base):
     id = Column(String(36), primary_key=True, default=gen_uuid)
     booking_id = Column(String(36), ForeignKey("bookings.id", ondelete="CASCADE"), nullable=False)
     requested_amount = Column(Numeric(10, 2))
+    counter_amount = Column(Numeric(10, 2), nullable=True)
     reason = Column(Text)
-    status = Column(String(20), default="pending")  # pending, approved, rejected
+    status = Column(String(20), default="pending")  # pending, approved, rejected, countered
     decided_by = Column(String(36), ForeignKey("users.id"), nullable=True)
     decided_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, server_default=func.now())

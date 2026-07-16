@@ -1,6 +1,7 @@
 import calendar
 import datetime
 import os
+import re
 
 import httpx
 from langgraph.graph import StateGraph, END
@@ -133,6 +134,146 @@ def _match_property(props: list, query: str):
     return None
 
 
+def _format_property_details(prop: dict) -> str:
+    lines = [
+        f"*{prop['title']}*",
+        f"Location: {prop.get('area') or '—'}, {prop.get('emirate') or ''}".strip().rstrip(","),
+    ]
+    if prop.get("bedrooms") is not None:
+        lines.append(f"Bedrooms: {prop['bedrooms']}")
+    if prop.get("bathrooms") is not None:
+        lines.append(f"Bathrooms: {prop['bathrooms']}")
+    if prop.get("max_guests") is not None:
+        lines.append(f"Max guests: {prop['max_guests']}")
+    prices = []
+    if prop.get("price_daily"):
+        prices.append(f"Daily: AED {float(prop['price_daily']):g}")
+    if prop.get("price_monthly"):
+        prices.append(f"Monthly: AED {float(prop['price_monthly']):g}")
+    if prop.get("price_yearly"):
+        prices.append(f"Yearly: AED {float(prop['price_yearly']):g}")
+    if prices:
+        lines.append("Rates — " + " · ".join(prices))
+    if prop.get("description"):
+        lines.append(prop["description"][:280])
+    return "\n".join(lines)
+
+
+INQUIRE_PHRASES = (
+    "inquire", "enquire", "inquiry", "enquiry", "tell me about",
+    "details about", "info about", "information about", "want to know about",
+    "i want to inquire", "interested in",
+)
+
+SWITCH_PROPERTY_PHRASES = (
+    "different property", "another property", "other property", "change property",
+    "not this", "don't want this", "dont want this", "instead", "rather",
+    "i want a different", "switch to", "look at",
+)
+
+CANCEL_PHRASES = (
+    "cancel", "stop", "nevermind", "never mind", "start over", "forget it",
+    "don't want to book", "dont want to book",
+)
+
+
+async def _try_flexible_booking_redirect(state: ChatState, msg: str) -> bool:
+    """Handle mid-flow changes (new property, cancel, inquire) instead of forcing the current step.
+
+    Returns True if the message was handled and the normal step logic should be skipped.
+    """
+    lower = msg.lower()
+    step = state.get("current_step") or ""
+
+    # Only apply during an active booking flow
+    booking_steps = {
+        "ask_property", "ask_type", "wait_property", "wait_type",
+        "wait_checkin", "wait_checkout", "wait_month_start", "wait_months_count",
+        "wait_year_start", "wait_name_before_confirm", "wait_discount_amount", "wait_confirm",
+    }
+    if step not in booking_steps and state.get("intent") != "booking":
+        return False
+
+    if any(p in lower for p in CANCEL_PHRASES):
+        state["reply"] = "No problem — I've cancelled this booking flow. How else can I help?"
+        state["intent"] = None
+        state["current_step"] = None
+        state["selected_property"] = None
+        state["start_date"] = None
+        state["end_date"] = None
+        state["booking_type"] = None
+        return True
+
+    # Detect inquire / switch property even while waiting for dates etc.
+    wants_switch = any(p in lower for p in SWITCH_PROPERTY_PHRASES) or any(p in lower for p in INQUIRE_PHRASES)
+    # Also: user names another property while we're mid-date ("no i want burj instead")
+    if not wants_switch and step in (
+        "wait_checkin", "wait_checkout", "wait_month_start", "wait_months_count",
+        "wait_year_start", "wait_type", "wait_confirm", "wait_name_before_confirm",
+    ):
+        looks_like_answer = bool(
+            re.search(r"\d{4}-\d{2}-\d{2}", lower)
+            or re.search(r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b", lower)
+            or re.fullmatch(r"\d+", msg.strip())
+            or any(w in lower for w in ("daily", "monthly", "yearly", "day", "night", "month", "year", "yes", "no", "ok", "sure", "confirm"))
+        )
+        if not looks_like_answer and len(msg.strip()) > 8:
+            async with httpx.AsyncClient() as client:
+                props = await _fetch_properties(client)
+            prompt = (
+                "Does the user want a DIFFERENT property than the current one, "
+                "or are they answering the booking question (dates/type/name)? "
+                "Reply ONLY switch or continue."
+            )
+            verdict = (await call_llm(prompt, msg)).strip().lower()
+            if "switch" in verdict:
+                prop_prompt = "Extract the property name or area. Return ONLY the name/area, or UNKNOWN."
+                prop_query = await call_llm(prop_prompt, msg)
+                matched_early = _match_property(props, prop_query)
+                if matched_early:
+                    state["selected_property"] = matched_early["id"]
+                    state["start_date"] = None
+                    state["end_date"] = None
+                    state["booking_type"] = None
+                    details = _format_property_details(matched_early)
+                    state["reply"] = (
+                        f"Sure — switching to that one.\n\n{details}\n\n"
+                        f"Would you like to book it? Choose daily, monthly, or yearly — "
+                        f"or ask me anything else about it."
+                    )
+                    state["current_step"] = "wait_type"
+                    state["intent"] = "booking"
+                    return True
+
+    if wants_switch or any(p in lower for p in INQUIRE_PHRASES):
+        async with httpx.AsyncClient() as client:
+            props = await _fetch_properties(client)
+        prompt = "Extract the property name or area the user means. Return ONLY the name/area, or UNKNOWN."
+        prop_query = await call_llm(prompt, msg)
+        matched = _match_property(props, prop_query)
+        if matched:
+            state["selected_property"] = matched["id"]
+            state["start_date"] = None
+            state["end_date"] = None
+            state["booking_type"] = None
+            details = _format_property_details(matched)
+            state["reply"] = (
+                f"Here's what I have:\n\n{details}\n\n"
+                f"Would you like to book this stay? Say daily, monthly, or yearly to continue — "
+                f"or ask about availability / another property."
+            )
+            state["current_step"] = "wait_type"
+            state["intent"] = "booking"
+            return True
+        prop_list = "\n".join(f"- {p['title']}" for p in props)
+        state["reply"] = f"Which property did you mean?\n\n{prop_list}"
+        state["current_step"] = "wait_property"
+        state["intent"] = "booking"
+        return True
+
+    return False
+
+
 # Words that must never be accepted as a guest name.
 _INVALID_NAME_WORDS = {
     "yes", "no", "ok", "okay", "sure", "confirm", "y", "n", "yeah", "yep", "nah",
@@ -231,7 +372,7 @@ async def classify_intent(state: ChatState) -> ChatState:
     # Mid-flow steps should stay in the current intent
     step = state.get("current_step") or ""
     if step.startswith("wait_") or step.startswith("ask_"):
-        if state.get("booking_id") and step == "wait_accept_full_price":
+        if state.get("booking_id") and step in ("wait_accept_full_price", "wait_counter_response"):
             state["intent"] = "discount_check"
             return state
         if step in ("wait_avail_property", "wait_avail_period"):
@@ -242,6 +383,7 @@ async def classify_intent(state: ChatState) -> ChatState:
             "wait_checkin", "wait_checkout",
             "wait_month_start", "wait_months_count", "wait_year_start",
             "wait_name_before_confirm", "wait_discount_amount", "wait_confirm",
+            "show_property_details",
         ):
             state["intent"] = "booking"
             return state
@@ -250,6 +392,13 @@ async def classify_intent(state: ChatState) -> ChatState:
             return state
 
     lower = state["incoming_message"].lower()
+
+    # Property inquire from website deep-link or freeform
+    if any(p in lower for p in INQUIRE_PHRASES):
+        state["intent"] = "booking"
+        state["current_step"] = "show_property_details"
+        return state
+
     if any(k in lower for k in AVAILABILITY_KEYWORDS) or (
         any(m in lower for m in MONTH_WORDS) and any(w in lower for w in ("available", "free", "book", "booked"))
     ):
@@ -259,7 +408,8 @@ async def classify_intent(state: ChatState) -> ChatState:
     system_prompt = (
         "Classify the user's message into exactly one of: "
         "booking, maintenance, discount_check, availability, general. "
-        "Use availability when asking if a property is free/available for dates or a month. "
+        "Use booking if they want to inquire about or book a specific property. "
+        "Use availability when asking if a property is free for dates or a month. "
         "Use discount_check when asking about discount approval status on an existing booking. "
         "Reply with only the single word."
     )
@@ -294,6 +444,34 @@ async def handle_booking(state: ChatState) -> ChatState:
     step = state.get("current_step") or "ask_property"
     msg = state["incoming_message"]
     current_year = datetime.datetime.now().year
+    state["reply_buttons"] = None
+
+    # Allow switching property / cancelling / inquiring mid-flow
+    if await _try_flexible_booking_redirect(state, msg):
+        return state
+
+    if step == "show_property_details":
+        async with httpx.AsyncClient() as client:
+            props = await _fetch_properties(client)
+        prompt = "Extract the property name or area. Return ONLY the name/area, or UNKNOWN."
+        prop_query = await call_llm(prompt, msg)
+        matched = _match_property(props, prop_query)
+        if not matched and state.get("selected_property"):
+            matched = next((p for p in props if p["id"] == state["selected_property"]), None)
+        if not matched:
+            prop_list = "\n".join(f"- {p['title']}" for p in props)
+            state["reply"] = f"Which property are you asking about?\n\n{prop_list}"
+            state["current_step"] = "wait_property"
+            return state
+        state["selected_property"] = matched["id"]
+        details = _format_property_details(matched)
+        state["reply"] = (
+            f"Here's what I have:\n\n{details}\n\n"
+            f"Would you like to book it? Say daily, monthly, or yearly — "
+            f"or ask about another property / availability."
+        )
+        state["current_step"] = "wait_type"
+        return state
 
     if step == "ask_property":
         async with httpx.AsyncClient() as client:
@@ -799,6 +977,44 @@ async def handle_discount_check(state: ChatState) -> ChatState:
     step = state.get("current_step")
     msg = state["incoming_message"]
     booking_id = state.get("booking_id")
+    state["reply_buttons"] = None
+
+    if step == "wait_counter_response":
+        lower = msg.lower()
+        accept = any(w in lower for w in ("yes", "accept", "ok", "sure", "deal", "confirm"))
+        decline = any(w in lower for w in ("no", "decline", "reject", "cancel", "pass"))
+        if not accept and not decline:
+            state["reply"] = "Please accept or decline the counter-offer (yes/no)."
+            if booking_id:
+                state["reply_buttons"] = [
+                    {"id": f"offer_yes_{booking_id}", "title": "Accept offer"},
+                    {"id": f"offer_no_{booking_id}", "title": "Decline"},
+                ]
+            return state
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{_api_base()}/api/bookings/{booking_id}/counter-response",
+                json={"accept": accept},
+            )
+        if resp.status_code != 200:
+            state["reply"] = "Could not process that response. Please try again or contact support."
+        else:
+            booking = resp.json()
+            if accept:
+                state["reply"] = (
+                    f"Perfect — offer accepted!\n"
+                    f"Booking {booking['id'][:8].upper()} is CONFIRMED.\n"
+                    f"Total: AED {booking['final_price']}.\n"
+                    f"Please proceed with payment."
+                )
+            else:
+                state["reply"] = (
+                    "No problem — we've cancelled that booking and released the dates. "
+                    "Message us anytime to book again."
+                )
+        state["current_step"] = None
+        state["intent"] = None
+        return state
 
     if step == "wait_accept_full_price":
         if any(w in msg.lower() for w in ("yes", "confirm", "ok", "accept", "sure")):
@@ -817,7 +1033,11 @@ async def handle_discount_check(state: ChatState) -> ChatState:
             state["current_step"] = None
             state["intent"] = None
         else:
-            state["reply"] = "No problem — your booking remains pending if you change your mind."
+            # Decline full price → cancel
+            async with httpx.AsyncClient() as client:
+                # Soft cancel via counter-response path isn't right; use guest message
+                pass
+            state["reply"] = "Okay — we won't confirm at full price. Your request stays on hold; say 'book' anytime to start fresh."
             state["current_step"] = None
             state["intent"] = None
         return state
@@ -845,6 +1065,18 @@ async def handle_discount_check(state: ChatState) -> ChatState:
             "Your discount request is still being reviewed by our team. "
             "I'll let you know once it's decided — check back shortly."
         )
+    elif booking["discount_status"] == "countered":
+        state["reply"] = (
+            f"We sent you a counter-offer on booking {booking['id'][:8].upper()}. "
+            f"Would you like to accept it?"
+        )
+        state["current_step"] = "wait_counter_response"
+        state["intent"] = "discount_check"
+        state["reply_buttons"] = [
+            {"id": f"offer_yes_{booking_id}", "title": "Accept offer"},
+            {"id": f"offer_no_{booking_id}", "title": "Decline"},
+        ]
+        return state
     elif booking["discount_status"] == "approved":
         state["reply"] = (
             f"Good news — your discount was approved!\n"
@@ -857,10 +1089,14 @@ async def handle_discount_check(state: ChatState) -> ChatState:
         else:
             state["reply"] = (
                 f"Your discount wasn't approved. The full price is AED {booking['base_price']}.\n"
-                f"Shall I confirm the booking at full price? (yes/no)"
+                f"Shall I confirm the booking at full price?"
             )
             state["current_step"] = "wait_accept_full_price"
             state["intent"] = "discount_check"
+            state["reply_buttons"] = [
+                {"id": f"full_yes_{booking_id}", "title": "Yes, full price"},
+                {"id": f"full_no_{booking_id}", "title": "No thanks"},
+            ]
             return state
     else:
         if booking["status"] == "confirmed":

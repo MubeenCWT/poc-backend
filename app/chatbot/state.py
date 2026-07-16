@@ -28,3 +28,9 @@ class ChatState(TypedDict, total=False):
 
     # discount status check
     check_name: Optional[str]
+
+    # interactive reply buttons for WhatsApp (optional)
+    reply_buttons: Optional[List[Dict[str, str]]]
+
+    # counter-offer amount awaiting tenant response
+    counter_amount: Optional[float]

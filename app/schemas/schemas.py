@@ -105,4 +105,9 @@ class MaintenanceCreate(BaseModel):
 
 # ---------- Discount ----------
 class DiscountDecision(BaseModel):
-    approve: bool
+    approve: bool = True
+    counter_amount: Optional[float] = None  # if set, sends a counter-offer instead
+
+
+class CounterResponse(BaseModel):
+    accept: bool
