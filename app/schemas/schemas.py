@@ -37,6 +37,10 @@ class PropertyOut(PropertyCreate):
     owner_id: Optional[str] = None
     status: str
     created_at: datetime
+    block_active: bool = False
+    block_start: Optional[date] = None
+    block_end: Optional[date] = None
+    listing_label: str = "live"  # live | blocked | blocked_soon | removed
 
     class Config:
         from_attributes = True

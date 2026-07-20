@@ -263,6 +263,13 @@ async def _handle_button_id(button_id: str, db) -> bool:
     return False
 
 
+async def _handle_portfolio_button(button_id: str, db, phone: str) -> bool:
+    """Admin portfolio menu / property picker buttons."""
+    if not button_id.startswith(("pf_act_", "pf_pick_", "pf_confirm_")):
+        return False
+    return await _try_admin_portfolio_message(phone, "", db, button_id=button_id)
+
+
 async def _try_admin_command(text: str, db, phone: str) -> bool:
     """Handle admin WhatsApp text commands (and pending counter-amount entry)."""
     admin_number = settings.ADMIN_WHATSAPP_NUMBER
@@ -445,7 +452,7 @@ async def _try_admin_command(text: str, db, phone: str) -> bool:
     return True
 
 
-async def _try_admin_portfolio_message(phone: str, text: str, db) -> bool:
+async def _try_admin_portfolio_message(phone: str, text: str, db, button_id: str | None = None) -> bool:
     """Portfolio commands for admin (vacant count, release dates, blocks, offline)."""
     if not find_admin_by_phone(db, phone):
         return False
@@ -457,10 +464,13 @@ async def _try_admin_portfolio_message(phone: str, text: str, db) -> bool:
         db.add(session)
         db.flush()
 
-    db.add(ChatbotMessage(session_id=session.id, direction="inbound", message_text=text))
+    inbound = button_id or text
+    db.add(ChatbotMessage(session_id=session.id, direction="inbound", message_text=inbound))
 
     state = dict(session.state or {})
-    reply, new_state, reply_buttons = await handle_admin_portfolio_message(db, text, state)
+    reply, new_state, reply_buttons = await handle_admin_portfolio_message(
+        db, text, state, button_id=button_id
+    )
 
     session.state = new_state
     session.last_intent = "admin_portfolio"
@@ -481,11 +491,14 @@ async def _handle_message(phone: str, text: str, button_id: str | None = None) -
         if button_id and await _handle_button_id(button_id, db):
             return
 
+        if button_id and await _handle_portfolio_button(button_id, db, phone):
+            return
+
         admin_digits = _digits(settings.ADMIN_WHATSAPP_NUMBER)
         if admin_digits and _digits(phone) == admin_digits:
             if await _try_admin_command(text, db, phone):
                 return
-            if await _try_admin_portfolio_message(phone, text, db):
+            if await _try_admin_portfolio_message(phone, text, db, button_id=button_id):
                 return
 
         session_id = f"wa_{phone}"

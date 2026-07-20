@@ -6,8 +6,13 @@ from app.database import get_db
 from app.models.models import Property, User
 from app.schemas.schemas import PropertyCreate, PropertyOut
 from app.services.deps import get_current_admin, get_optional_admin
+from app.services.property_status import serialize_property
 
 router = APIRouter(prefix="/properties", tags=["properties"])
+
+
+def _property_out(db: Session, prop: Property) -> PropertyOut:
+    return PropertyOut(**serialize_property(db, prop))
 
 
 @router.get("/", response_model=List[PropertyOut])
@@ -23,7 +28,8 @@ def list_properties(
     if include_inactive:
         if admin is None:
             raise HTTPException(status_code=401, detail="Admin authentication required")
-        return db.query(Property).order_by(Property.created_at.desc()).all()
+        props = db.query(Property).order_by(Property.created_at.desc()).all()
+        return [_property_out(db, p) for p in props]
 
     query = db.query(Property).filter(Property.status == "active")
     if emirate:
@@ -32,7 +38,7 @@ def list_properties(
         query = query.filter(Property.area == area)
     if property_type:
         query = query.filter(Property.property_type == property_type)
-    return query.all()
+    return [_property_out(db, p) for p in query.all()]
 
 
 @router.get("/admin/all", response_model=List[PropertyOut])
@@ -41,7 +47,8 @@ def list_properties_admin(
     admin: User = Depends(get_current_admin),
 ):
     """Admin-only alias — prefer GET /?include_inactive=true on older deployments."""
-    return db.query(Property).order_by(Property.created_at.desc()).all()
+    props = db.query(Property).order_by(Property.created_at.desc()).all()
+    return [_property_out(db, p) for p in props]
 
 
 @router.get("/{property_id}", response_model=PropertyOut)
@@ -49,7 +56,7 @@ def get_property(property_id: str, db: Session = Depends(get_db)):
     prop = db.query(Property).filter(Property.id == property_id).first()
     if not prop:
         raise HTTPException(status_code=404, detail="Property not found")
-    return prop
+    return _property_out(db, prop)
 
 
 @router.post("/", response_model=PropertyOut)
@@ -63,7 +70,7 @@ def create_property(
     db.add(prop)
     db.commit()
     db.refresh(prop)
-    return prop
+    return _property_out(db, prop)
 
 
 @router.put("/{property_id}", response_model=PropertyOut)
@@ -80,7 +87,7 @@ def update_property(
         setattr(prop, key, value)
     db.commit()
     db.refresh(prop)
-    return prop
+    return _property_out(db, prop)
 
 
 @router.delete("/{property_id}")
@@ -113,4 +120,4 @@ def restore_property(
     prop.status = "active"
     db.commit()
     db.refresh(prop)
-    return prop
+    return _property_out(db, prop)
