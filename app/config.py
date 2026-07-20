@@ -14,7 +14,6 @@ class Settings(BaseSettings):
 
     # WhatsApp via the Meta WhatsApp Cloud API (test number)
     ADMIN_WHATSAPP_NUMBER: str = ""   # admin recipient, country code, e.g. +9715XXXXXXXX
-    OWNER_WHATSAPP_NUMBER: str = ""   # optional seed/demo owner WhatsApp number
     META_ACCESS_TOKEN: str = ""
     META_PHONE_NUMBER_ID: str = ""
     META_API_VERSION: str = "v21.0"

@@ -1,4 +1,4 @@
-"""WhatsApp assistant for property owners — portfolio, release dates, blocks, offline."""
+"""WhatsApp portfolio assistant for admin — vacant units, release dates, blocks, offline."""
 import datetime
 import json
 import re
@@ -10,14 +10,14 @@ from app.models.models import Property
 from app.services.owner_portfolio import (
     block_property_dates,
     bring_property_online,
-    match_owner_property,
+    match_portfolio_property,
     next_release_info,
-    owner_properties,
+    portfolio_properties,
     portfolio_summary,
     take_property_offline,
 )
 
-_OWNER_SYSTEM = """You are UAE Stays owner assistant. The owner manages rental apartments via WhatsApp.
+_ADMIN_PORTFOLIO_SYSTEM = """You are UAE Stays admin assistant. The admin manages all rental apartments via WhatsApp.
 
 Classify their message into ONE intent and extract fields as JSON only (no markdown):
 {
@@ -30,13 +30,13 @@ Classify their message into ONE intent and extract fields as JSON only (no markd
 Intent guide:
 - portfolio: how many vacant/not on rent, occupancy summary
 - release_date: when guest leaves, when apartment is free (checkout / release)
-- block_dates: block bookings on specific dates (owner use, not guest booking)
+- block_dates: block bookings on specific dates
 - take_offline: take property offline / unavailable for a period (e.g. next month)
 - bring_online: put property back on listings
 - help: menu, what can you do
 
 Today's date: {today}
-Owner properties: {property_list}
+Properties: {property_list}
 """
 
 
@@ -71,7 +71,7 @@ def _fmt_date(d: datetime.date | None) -> str:
 
 def _property_list_text(props: list) -> str:
     if not props:
-        return "(none assigned)"
+        return "(none yet)"
     return ", ".join(f"{p.title} ({p.area})" for p in props)
 
 
@@ -93,35 +93,33 @@ def _keyword_intent(text: str) -> dict:
     return {"intent": intent, "property_query": text, "start_date": "", "end_date": ""}
 
 
-async def handle_owner_message(db: Session, owner_id: str, text: str, state: dict) -> tuple[str, dict]:
+async def handle_admin_portfolio_message(db: Session, text: str, state: dict) -> tuple[str, dict]:
     """Returns (reply, updated_state)."""
-    props = owner_properties(db, owner_id)
+    props = portfolio_properties(db)
     today = datetime.date.today().isoformat()
     prop_names = _property_list_text(props)
 
-    # Continue multi-step flows
-    step = state.get("owner_step")
+    step = state.get("portfolio_step")
     if step == "pick_property":
-        prop = match_owner_property(db, owner_id, text)
+        prop = match_portfolio_property(db, text)
         if not prop:
             return (
-                f"I couldn't match that to your properties. Yours are: {prop_names}. "
-                "Please reply with the full name or area (e.g. Marina).",
+                f"I couldn't match that property. Yours are: {prop_names}. "
+                "Reply with the name or area (e.g. Marina).",
                 state,
             )
-        state["owner_property_id"] = prop.id
-        state["owner_property_title"] = prop.title
-        pending = state.get("owner_pending_intent")
+        state["portfolio_property_id"] = prop.id
+        pending = state.get("portfolio_pending_intent")
         if pending == "release_date":
-            state.pop("owner_step", None)
-            state.pop("owner_pending_intent", None)
+            state.pop("portfolio_step", None)
+            state.pop("portfolio_pending_intent", None)
             return _reply_release(db, prop), state
         if pending == "bring_online":
-            state = {k: v for k, v in state.items() if not k.startswith("owner_")}
+            state = {k: v for k, v in state.items() if not k.startswith("portfolio_")}
             bring_property_online(db, prop)
             return f"*{prop.title}* is active again and visible for bookings.", state
         if pending in ("block_dates", "take_offline"):
-            state["owner_step"] = "ask_start_date"
+            state["portfolio_step"] = "ask_start_date"
             return (
                 f"Got it — *{prop.title}*. From which date should I "
                 f"{'block bookings' if pending == 'block_dates' else 'take it offline'}? (e.g. 2026-08-01)",
@@ -132,21 +130,21 @@ async def handle_owner_message(db: Session, owner_id: str, text: str, state: dic
         start = _parse_date(text)
         if not start:
             return "Please send a start date as YYYY-MM-DD (e.g. 2026-08-01).", state
-        state["owner_start_date"] = start.isoformat()
-        state["owner_step"] = "ask_end_date"
+        state["portfolio_start_date"] = start.isoformat()
+        state["portfolio_step"] = "ask_end_date"
         return "And the end date? (YYYY-MM-DD)", state
 
     if step == "ask_end_date":
         end = _parse_date(text)
-        start = _parse_date(state.get("owner_start_date", ""))
+        start = _parse_date(state.get("portfolio_start_date", ""))
         if not end or not start:
             return "Please send a valid end date as YYYY-MM-DD.", state
         if end < start:
             return "End date must be on or after the start date. Send the end date again.", state
-        prop_id = state.get("owner_property_id")
+        prop_id = state.get("portfolio_property_id")
         prop = db.get(Property, prop_id) if prop_id else None
-        intent = state.get("owner_pending_intent", "block_dates")
-        state = {k: v for k, v in state.items() if not k.startswith("owner_")}
+        intent = state.get("portfolio_pending_intent", "block_dates")
+        state = {k: v for k, v in state.items() if not k.startswith("portfolio_")}
         if not prop:
             return "Something went wrong — please start again (e.g. 'block Marina from Aug 1 to Aug 10').", state
         try:
@@ -166,14 +164,13 @@ async def handle_owner_message(db: Session, owner_id: str, text: str, state: dic
         except ValueError as exc:
             return f"Couldn't do that: {exc}", state
 
-    # Fresh message — classify with LLM (keyword fallback if LLM unavailable)
     parsed: dict
     try:
         from app.config import settings as app_settings
 
         if app_settings.LLM_API_KEY and app_settings.LLM_API_BASE:
             raw = await call_llm(
-                _OWNER_SYSTEM.format(today=today, property_list=prop_names),
+                _ADMIN_PORTFOLIO_SYSTEM.format(today=today, property_list=prop_names),
                 text,
             )
             parsed = _parse_llm_json(raw)
@@ -181,6 +178,7 @@ async def handle_owner_message(db: Session, owner_id: str, text: str, state: dic
             parsed = _keyword_intent(text)
     except Exception:
         parsed = _keyword_intent(text)
+
     intent = parsed.get("intent", "unknown")
     prop_query = parsed.get("property_query", "")
     start_s = parsed.get("start_date", "")
@@ -190,16 +188,16 @@ async def handle_owner_message(db: Session, owner_id: str, text: str, state: dic
         return _help_text(prop_names), state
 
     if intent == "portfolio":
-        return _reply_portfolio(db, owner_id), state
+        return _reply_portfolio(db), state
 
-    prop = match_owner_property(db, owner_id, prop_query) if prop_query else None
+    prop = match_portfolio_property(db, prop_query) if prop_query else None
 
     if intent == "release_date":
         if not prop and len(props) == 1:
             prop = props[0]
         if not prop:
-            state["owner_step"] = "pick_property"
-            state["owner_pending_intent"] = "release_date"
+            state["portfolio_step"] = "pick_property"
+            state["portfolio_pending_intent"] = "release_date"
             return (
                 f"Which property? Reply with the name or area.\nYour units: {prop_names}",
                 state,
@@ -228,41 +226,39 @@ async def handle_owner_message(db: Session, owner_id: str, text: str, state: dic
             except ValueError as exc:
                 return f"Couldn't do that: {exc}", state
         if not prop:
-            state["owner_step"] = "pick_property"
-            state["owner_pending_intent"] = intent
+            state["portfolio_step"] = "pick_property"
+            state["portfolio_pending_intent"] = intent
             if start:
-                state["owner_start_date"] = start.isoformat()
-            if end:
-                state["owner_end_date"] = end.isoformat()
+                state["portfolio_start_date"] = start.isoformat()
             return (
                 f"Which property should I "
                 f"{'block' if intent == 'block_dates' else 'take offline'}?\n"
                 f"Your units: {prop_names}",
                 state,
             )
-        state["owner_property_id"] = prop.id
-        state["owner_pending_intent"] = intent
+        state["portfolio_property_id"] = prop.id
+        state["portfolio_pending_intent"] = intent
         if not start:
-            state["owner_step"] = "ask_start_date"
+            state["portfolio_step"] = "ask_start_date"
             return f"From which date for *{prop.title}*? (YYYY-MM-DD)", state
         if not end:
-            state["owner_start_date"] = start.isoformat()
-            state["owner_step"] = "ask_end_date"
+            state["portfolio_start_date"] = start.isoformat()
+            state["portfolio_step"] = "ask_end_date"
             return f"Until which date for *{prop.title}*? (YYYY-MM-DD)", state
 
     if intent == "bring_online":
         if not prop and len(props) == 1:
             prop = props[0]
         if not prop:
-            state["owner_step"] = "pick_property"
-            state["owner_pending_intent"] = "bring_online"
+            state["portfolio_step"] = "pick_property"
+            state["portfolio_pending_intent"] = "bring_online"
             return f"Which property should go back online?\nYour units: {prop_names}", state
         bring_property_online(db, prop)
         return f"*{prop.title}* is active again and visible for bookings.", state
 
     return (
-        "I'm your UAE Stays owner assistant. Try:\n"
-        "• How many of my apartments are vacant?\n"
+        "Portfolio commands (admin):\n"
+        "• How many apartments are vacant?\n"
         "• When is my Marina apartment released by the guest?\n"
         "• Block JBR Penthouse from 2026-08-01 to 2026-08-15\n"
         "• Take Downtown Studio offline for next month\n\n"
@@ -273,18 +269,18 @@ async def handle_owner_message(db: Session, owner_id: str, text: str, state: dic
 
 def _help_text(prop_names: str) -> str:
     return (
-        "*Owner commands (UAE Stays)*\n\n"
+        "*Admin portfolio commands (UAE Stays)*\n\n"
         "• *Portfolio* — how many units are vacant / on rent\n"
         "• *Release date* — when a guest checks out / unit is free\n"
         "• *Block dates* — stop bookings on specific dates\n"
-        "• *Take offline* — hide a unit for a period (e.g. next month)\n"
+        "• *Take offline* — hide a unit for a period\n"
         "• *Bring online* — list a unit again\n\n"
-        f"Your properties: {prop_names}"
+        f"Properties: {prop_names}"
     )
 
 
-def _reply_portfolio(db: Session, owner_id: str) -> str:
-    summary = portfolio_summary(db, owner_id)
+def _reply_portfolio(db: Session) -> str:
+    summary = portfolio_summary(db)
     lines = [
         f"*Your portfolio* (as of {_fmt_date(summary['as_of'])})",
         f"Total: {summary['total']} | Vacant: {len(summary['vacant'])} | "
@@ -311,7 +307,7 @@ def _reply_portfolio(db: Session, owner_id: str) -> str:
 def _reply_release(db: Session, prop) -> str:
     info = next_release_info(db, prop)
     if info["status"] == "available":
-        return f"*{prop.title}* is available now — no active guest booking or owner block."
+        return f"*{prop.title}* is available now — no active guest booking or block."
     if info["status"] == "offline":
         return f"*{prop.title}* is currently offline from guest bookings."
     release = info.get("available_from")

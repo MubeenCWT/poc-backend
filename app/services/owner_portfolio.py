@@ -1,41 +1,35 @@
-"""Portfolio queries and availability management for property owners."""
+"""Portfolio queries and availability management for the admin (property owner)."""
 import datetime
 from typing import Optional
 
-from sqlalchemy import and_
 from sqlalchemy.orm import Session
 
-from app.models.models import Booking, Property, PropertyAvailability
+from app.config import settings
+from app.models.models import Booking, Property, PropertyAvailability, User
 
 
 def _digits(phone: str) -> str:
     return "".join(ch for ch in (phone or "") if ch.isdigit())
 
 
-def find_owner_by_phone(db: Session, phone: str) -> Optional[object]:
-    from app.models.models import User
-
-    digits = _digits(phone)
-    if not digits:
+def find_admin_by_phone(db: Session, phone: str) -> Optional[User]:
+    """Admin WhatsApp number is treated as the property owner."""
+    admin_digits = _digits(settings.ADMIN_WHATSAPP_NUMBER)
+    if not admin_digits or _digits(phone) != admin_digits:
         return None
-    for user in db.query(User).filter(User.role == "owner", User.is_active == True).all():  # noqa: E712
-        if user.phone and _digits(user.phone) == digits:
-            return user
-    return None
+    return db.query(User).filter(User.role == "admin", User.is_active == True).first()  # noqa: E712
 
 
-def owner_properties(db: Session, owner_id: str, active_only: bool = False) -> list[Property]:
-    q = db.query(Property).filter(Property.owner_id == owner_id)
-    if active_only:
-        q = q.filter(Property.status == "active")
-    return q.order_by(Property.title).all()
+def portfolio_properties(db: Session) -> list[Property]:
+    """All properties — admin is the sole owner in this deployment."""
+    return db.query(Property).order_by(Property.title).all()
 
 
-def match_owner_property(db: Session, owner_id: str, query: str) -> Optional[Property]:
+def match_portfolio_property(db: Session, query: str) -> Optional[Property]:
     q = query.lower().strip()
     if not q or q == "unknown":
         return None
-    for prop in owner_properties(db, owner_id):
+    for prop in portfolio_properties(db):
         title = (prop.title or "").lower()
         area = (prop.area or "").lower()
         if q in title or title in q or (area and (q in area or area in q)):
@@ -45,24 +39,24 @@ def match_owner_property(db: Session, owner_id: str, query: str) -> Optional[Pro
 
 def _is_occupied_on(db: Session, prop: Property, day: datetime.date) -> bool:
     if prop.status != "active":
-        return True  # offline = not available for rent
+        return True
     row = (
-      db.query(PropertyAvailability)
-      .filter(
-          PropertyAvailability.property_id == prop.id,
-          PropertyAvailability.status.in_(["booked", "blocked"]),
-          PropertyAvailability.start_date <= day,
-          PropertyAvailability.end_date >= day,
-      )
-      .first()
-  )
-  return row is not None
+        db.query(PropertyAvailability)
+        .filter(
+            PropertyAvailability.property_id == prop.id,
+            PropertyAvailability.status.in_(["booked", "blocked"]),
+            PropertyAvailability.start_date <= day,
+            PropertyAvailability.end_date >= day,
+        )
+        .first()
+    )
+    return row is not None
 
 
-def portfolio_summary(db: Session, owner_id: str, as_of: Optional[datetime.date] = None) -> dict:
+def portfolio_summary(db: Session, as_of: Optional[datetime.date] = None) -> dict:
     """How many units are vacant vs occupied today."""
     day = as_of or datetime.date.today()
-    props = owner_properties(db, owner_id)
+    props = portfolio_properties(db)
     vacant = []
     occupied = []
     offline = []
@@ -103,7 +97,6 @@ def next_release_info(db: Session, prop: Property, from_date: Optional[datetime.
         return {"status": "available", "available_from": day, "message": "Available now — no active booking or block."}
 
     latest_end = max(r.end_date for r in future)
-    # Check if currently occupied
     currently_busy = any(r.start_date <= day <= r.end_date for r in future)
     if not currently_busy and prop.status == "active":
         return {"status": "available", "available_from": day, "message": "Available now."}

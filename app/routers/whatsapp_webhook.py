@@ -13,7 +13,7 @@ import re
 from fastapi import APIRouter, BackgroundTasks, Query, Request, Response
 
 from app.chatbot.graph import chatbot_graph
-from app.chatbot.owner_graph import handle_owner_message
+from app.chatbot.owner_graph import handle_admin_portfolio_message
 from app.config import settings
 from app.database import SessionLocal
 from app.models.models import Booking, ChatbotMessage, ChatbotSession
@@ -30,7 +30,7 @@ from app.services.booking_confirm import (
     admin_payment_buttons,
 )
 from app.services.notify import send_whatsapp_text, send_whatsapp_buttons, send_admin_alert
-from app.services.owner_portfolio import find_owner_by_phone
+from app.services.owner_portfolio import find_admin_by_phone
 
 logger = logging.getLogger(__name__)
 
@@ -446,27 +446,25 @@ async def _try_admin_command(text: str, db, phone: str) -> bool:
     return True
 
 
-async def _try_owner_message(phone: str, text: str, db) -> bool:
-    """Route registered property owners to the owner portfolio assistant."""
-    owner = find_owner_by_phone(db, phone)
-    if not owner:
+async def _try_admin_portfolio_message(phone: str, text: str, db) -> bool:
+    """Portfolio commands for admin (vacant count, release dates, blocks, offline)."""
+    if not find_admin_by_phone(db, phone):
         return False
 
-    session_id = f"owner_wa_{_digits(phone)}"
+    session_id = f"admin_portfolio_{_digits(phone)}"
     session = db.query(ChatbotSession).filter(ChatbotSession.id == session_id).first()
     if not session:
-        session = ChatbotSession(id=session_id, phone=phone, state={"role": "owner"})
+        session = ChatbotSession(id=session_id, phone=phone, state={})
         db.add(session)
         db.flush()
 
     db.add(ChatbotMessage(session_id=session.id, direction="inbound", message_text=text))
 
     state = dict(session.state or {})
-    state["owner_id"] = owner.id
-    reply, new_state = await handle_owner_message(db, owner.id, text, state)
+    reply, new_state = await handle_admin_portfolio_message(db, text, state)
 
     session.state = new_state
-    session.last_intent = "owner"
+    session.last_intent = "admin_portfolio"
     db.add(ChatbotMessage(session_id=session.id, direction="outbound", message_text=reply))
     db.commit()
 
@@ -485,9 +483,8 @@ async def _handle_message(phone: str, text: str, button_id: str | None = None) -
         if admin_digits and _digits(phone) == admin_digits:
             if await _try_admin_command(text, db, phone):
                 return
-
-        if await _try_owner_message(phone, text, db):
-            return
+            if await _try_admin_portfolio_message(phone, text, db):
+                return
 
         session_id = f"wa_{phone}"
         session = db.query(ChatbotSession).filter(ChatbotSession.id == session_id).first()
