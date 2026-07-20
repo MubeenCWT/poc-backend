@@ -8,7 +8,10 @@ from langgraph.graph import StateGraph, END
 
 from app.chatbot.state import ChatState
 from app.chatbot.llm_client import call_llm
+from app.chatbot.owner_graph import next_release_info
 from app.config import settings
+from app.database import SessionLocal
+from app.models.models import Property
 
 
 def _api_base() -> str:
@@ -26,9 +29,120 @@ def _api_base() -> str:
 
 def _parse_iso(value: str):
     try:
-        return datetime.date.fromisoformat(value)
+        return datetime.date.fromisoformat(value.strip())
     except (ValueError, TypeError):
         return None
+
+
+async def _parse_user_date(msg: str, current_year: int) -> datetime.date | None:
+    """Parse dates from many common formats — not only YYYY-MM-DD."""
+    raw = (msg or "").strip()
+    if not raw:
+        return None
+
+    lower = raw.lower()
+    today = datetime.date.today()
+    if "next month" in lower:
+        return _add_months(today.replace(day=1), 1)
+    if "this month" in lower:
+        return today.replace(day=1)
+
+    iso_match = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", raw)
+    if iso_match:
+        parsed = _parse_iso(iso_match.group(1))
+        if parsed:
+            return parsed
+
+    for fmt in (
+        "%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y",
+        "%d %b %Y", "%d %B %Y", "%b %d %Y", "%B %d %Y",
+        "%b %d, %Y", "%B %d, %Y",
+        "%d %b", "%d %B", "%b %d", "%B %d",
+    ):
+        try:
+            parsed = datetime.datetime.strptime(raw, fmt).date()
+            if parsed.year < 100:
+                parsed = parsed.replace(year=current_year)
+            elif fmt in ("%d %b", "%d %B", "%b %d", "%B %d") and parsed.year == 1900:
+                parsed = parsed.replace(year=current_year)
+            return parsed
+        except ValueError:
+            continue
+
+    prompt = (
+        f"Convert the user's message to a single date in YYYY-MM-DD format. "
+        f"Today is {datetime.date.today().isoformat()}. "
+        f"If no year is given, use {current_year}. "
+        f"If the message is NOT asking for or giving a date, reply exactly: UNKNOWN. "
+        f"Return ONLY the date or UNKNOWN."
+    )
+    llm_out = (await call_llm(prompt, raw)).strip()
+    if not llm_out or llm_out.upper() == "UNKNOWN":
+        return None
+    match = re.search(r"\d{4}-\d{2}-\d{2}", llm_out)
+    if match:
+        return _parse_iso(match.group(0))
+    return _parse_iso(llm_out)
+
+
+RELEASE_QUERY_PHRASES = (
+    "when will", "when is", "when does", "when can", "when could",
+    "released", "release date", "available again", "free again",
+    "next available", "become available", "occupied until", "booked until",
+    "guest leave", "check out", "checkout",
+)
+
+
+def _is_release_query(msg: str) -> bool:
+    lower = (msg or "").lower()
+    if not any(w in lower for w in ("when", "release", "available", "free", "occupied", "booked", "vacant")):
+        return False
+    return "?" in lower or any(p in lower for p in RELEASE_QUERY_PHRASES)
+
+
+def _release_info_reply(property_id: str) -> str:
+    db = SessionLocal()
+    try:
+        prop = db.get(Property, property_id)
+        if not prop:
+            return "I couldn't find that property."
+        info = next_release_info(db, prop)
+        title = prop.title
+        if info["status"] == "available":
+            return (
+                f"*{title}* is available right now — you can book it for your preferred dates.\n\n"
+                f"What check-in date works for you?"
+            )
+        if info["status"] == "offline":
+            return f"*{title}* is currently offline and not accepting new bookings."
+        release = info.get("available_from")
+        guest = info.get("guest")
+        end = info.get("booking_end")
+        lines = [f"Here's when *{title}* will be free:"]
+        if guest:
+            lines.append(f"Current guest: {guest}")
+        if end:
+            lines.append(f"Current stay ends: {end.strftime('%d %b %Y')}")
+        if release:
+            lines.append(f"Available for new bookings from: *{release.strftime('%d %b %Y')}*")
+        lines.append("\nWant to book from that date? Just tell me your check-in.")
+        return "\n".join(lines)
+    finally:
+        db.close()
+
+
+def _try_answer_release_query(state: ChatState, msg: str) -> bool:
+    """Answer open questions like 'when will it be released?' mid-booking."""
+    if not _is_release_query(msg):
+        return False
+    prop_id = state.get("selected_property")
+    if not prop_id:
+        state["reply"] = "Which property are you asking about?"
+        state["current_step"] = "wait_property"
+        state["intent"] = "booking"
+        return True
+    state["reply"] = _release_info_reply(prop_id)
+    return True
 
 
 def _add_months(d: datetime.date, months: int) -> datetime.date:
@@ -212,6 +326,8 @@ async def _try_flexible_booking_redirect(state: ChatState, msg: str) -> bool:
         "wait_checkin", "wait_checkout", "wait_month_start", "wait_months_count",
         "wait_year_start", "wait_type", "wait_confirm", "wait_name_before_confirm",
     ):
+        if _is_release_query(msg):
+            return False
         looks_like_answer = bool(
             re.search(r"\d{4}-\d{2}-\d{2}", lower)
             or re.search(r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b", lower)
@@ -403,7 +519,7 @@ async def classify_intent(state: ChatState) -> ChatState:
         state["current_step"] = "show_property_details"
         return state
 
-    if any(k in lower for k in AVAILABILITY_KEYWORDS) or (
+    if any(k in lower for k in AVAILABILITY_KEYWORDS) or _is_release_query(msg) or (
         any(m in lower for m in MONTH_WORDS) and any(w in lower for w in ("available", "free", "book", "booked"))
     ):
         state["intent"] = "availability"
@@ -453,6 +569,9 @@ async def handle_booking(state: ChatState) -> ChatState:
     msg = state["incoming_message"]
     current_year = datetime.datetime.now().year
     state["reply_buttons"] = None
+
+    if _try_answer_release_query(state, msg):
+        return state
 
     # Allow switching property / cancelling / inquiring mid-flow
     if await _try_flexible_booking_redirect(state, msg):
@@ -547,7 +666,7 @@ async def handle_booking(state: ChatState) -> ChatState:
             state["current_step"] = "wait_year_start"
         elif "dai" in lower or "day" in lower or "night" in lower:
             state["booking_type"] = "daily"
-            state["reply"] = "Great — what is your check-in date? (e.g. 2026-03-10)"
+            state["reply"] = "Great — what is your check-in date? (e.g. 22 July or 2026-07-22)"
             state["current_step"] = "wait_checkin"
         else:
             state["reply"] = "Please choose daily, monthly, or yearly."
@@ -555,13 +674,15 @@ async def handle_booking(state: ChatState) -> ChatState:
 
     # ---- Daily: explicit check-in / check-out days ----
     if step == "wait_checkin":
-        prompt = (
-            f"Extract the check-in date from this message and format it as YYYY-MM-DD. "
-            f"Assume the year is {current_year} unless specified otherwise. Return ONLY the date."
-        )
-        parsed = _parse_iso((await call_llm(prompt, msg)).strip())
+        if _try_answer_release_query(state, msg):
+            return state
+        parsed = await _parse_user_date(msg, current_year)
         if not parsed:
-            state["reply"] = "I couldn't read that date. Please use a format like 2026-03-10."
+            state["reply"] = (
+                "I couldn't quite catch that date. You can say things like "
+                "22 July, 22/07/2026, or 2026-07-22.\n"
+                "Or ask: *when will this property be released?*"
+            )
             return state
         state["start_date"] = parsed.isoformat()
         state["reply"] = "And your check-out date?"
@@ -569,13 +690,15 @@ async def handle_booking(state: ChatState) -> ChatState:
         return state
 
     if step == "wait_checkout":
-        prompt = (
-            f"Extract the check-out date from this message and format it as YYYY-MM-DD. "
-            f"Assume the year is {current_year} unless specified otherwise. Return ONLY the date."
-        )
-        parsed = _parse_iso((await call_llm(prompt, msg)).strip())
+        if _try_answer_release_query(state, msg):
+            return state
+        parsed = await _parse_user_date(msg, current_year)
         if not parsed:
-            state["reply"] = "I couldn't read that date. Please use a format like 2026-03-15."
+            state["reply"] = (
+                "I couldn't quite catch that date. You can say things like "
+                "25 July, 25/07/2026, or 2026-07-25.\n"
+                "Or ask: *when will this property be released?*"
+            )
             return state
         if parsed <= datetime.date.fromisoformat(state["start_date"]):
             state["reply"] = "Check-out must be after check-in. What is your check-out date?"
@@ -585,21 +708,23 @@ async def handle_booking(state: ChatState) -> ChatState:
             start = datetime.date.fromisoformat(state["start_date"])
             end = datetime.date.fromisoformat(state["end_date"])
             state["reply"] = (
-                f"Sorry, this property is not available from {start.isoformat()} to {end.isoformat()}. "
-                f"When would you like to check in?"
+                f"Sorry, this property is not available from {start.strftime('%d %b %Y')} "
+                f"to {end.strftime('%d %b %Y')}.\n\n"
+                f"{_release_info_reply(state['selected_property'])}"
             )
             state["current_step"] = "wait_checkin"
         return state
 
     # ---- Monthly: start month + number of months ----
     if step == "wait_month_start":
-        prompt = (
-            f"Extract the start month from this message and format it as YYYY-MM-01 "
-            f"(always day 01). Assume the year is {current_year} unless specified. Return ONLY the date."
-        )
-        parsed = _parse_iso((await call_llm(prompt, msg)).strip())
+        if _try_answer_release_query(state, msg):
+            return state
+        parsed = await _parse_user_date(msg, current_year)
         if not parsed:
-            state["reply"] = "I couldn't read that month. Please tell me a month like March 2026."
+            state["reply"] = (
+                "Which month would you like to start? "
+                "You can say March 2026, next month, or 01/03/2026."
+            )
             return state
         start = parsed.replace(day=1)
         state["start_date"] = start.isoformat()
@@ -615,8 +740,8 @@ async def handle_booking(state: ChatState) -> ChatState:
         month_name = _month_label(start)
         if not available:
             state["reply"] = (
-                f"Sorry, {prop['title']} is not available in {month_name}. "
-                f"Which other month would you like to try?"
+                f"Sorry, {prop['title']} is not available in {month_name}.\n\n"
+                f"{_release_info_reply(state['selected_property'])}"
             )
             return state
 
@@ -644,28 +769,30 @@ async def handle_booking(state: ChatState) -> ChatState:
             start = datetime.date.fromisoformat(state["start_date"])
             state["reply"] = (
                 f"Sorry, this property is not available for that {months}-month period "
-                f"starting {_month_label(start)}. Which month would you like to start?"
+                f"starting {_month_label(start)}.\n\n"
+                f"{_release_info_reply(state['selected_property'])}"
             )
             state["current_step"] = "wait_month_start"
         return state
 
     # ---- Yearly: start month, check-out auto-set one year later ----
     if step == "wait_year_start":
-        prompt = (
-            f"Extract the start month from this message and format it as YYYY-MM-01 "
-            f"(always day 01). Assume the year is {current_year} unless specified. Return ONLY the date."
-        )
-        parsed = _parse_iso((await call_llm(prompt, msg)).strip())
+        if _try_answer_release_query(state, msg):
+            return state
+        parsed = await _parse_user_date(msg, current_year)
         if not parsed:
-            state["reply"] = "I couldn't read that month. Please tell me a month like March 2026."
+            state["reply"] = (
+                "Which month should the 1-year lease start? "
+                "You can say March 2026, next month, or 01/03/2026."
+            )
             return state
         start = parsed.replace(day=1)
         state["start_date"] = start.isoformat()
         state["end_date"] = _add_months(start, 12).isoformat()
         if not await _quote_and_advance(state):
             state["reply"] = (
-                f"Sorry, this property is not available for a year starting {_month_label(start)}. "
-                f"Which other month would you like?"
+                f"Sorry, this property is not available for a year starting {_month_label(start)}.\n\n"
+                f"{_release_info_reply(state['selected_property'])}"
             )
             state["current_step"] = "wait_year_start"
         return state
@@ -816,6 +943,10 @@ async def handle_availability(state: ChatState) -> ChatState:
     msg = state["incoming_message"]
     current_year = datetime.datetime.now().year
 
+    if _is_release_query(msg) and state.get("selected_property"):
+        state["reply"] = _release_info_reply(state["selected_property"])
+        return state
+
     async with httpx.AsyncClient() as client:
         props = await _fetch_properties(client)
 
@@ -838,9 +969,15 @@ async def handle_availability(state: ChatState) -> ChatState:
             state["current_step"] = "wait_avail_property"
             state["reply"] = "Which property are you asking about?"
             return state
+        if _is_release_query(msg):
+            state["reply"] = _release_info_reply(matched["id"])
+            return state
         period = await _resolve_availability_period(msg, current_year)
         if not period:
-            state["reply"] = "I couldn't read those dates. Try e.g. this month, next month, or March 2026."
+            state["reply"] = (
+                "I couldn't read those dates. Try e.g. this month, next month, March 2026, "
+                "or ask *when will it be released?*"
+            )
             return state
         start, end, label = period
         async with httpx.AsyncClient() as client:
@@ -854,8 +991,8 @@ async def handle_availability(state: ChatState) -> ChatState:
             )
         else:
             state["reply"] = (
-                f"No — {matched['title']} is not available in {label}.\n"
-                f"Try another month or a different property."
+                f"No — {matched['title']} is not available in {label}.\n\n"
+                f"{_release_info_reply(matched['id'])}"
             )
         state["intent"] = None
         state["current_step"] = None
@@ -883,9 +1020,12 @@ async def handle_availability(state: ChatState) -> ChatState:
     period = await _resolve_availability_period(msg, current_year)
 
     if not period:
+        if _is_release_query(msg):
+            state["reply"] = _release_info_reply(matched["id"])
+            return state
         state["reply"] = (
             f"Which month or dates should I check for {matched['title']}?\n"
-            f"(e.g. this month, next month, March 2026)"
+            f"(e.g. this month, next month, March 2026 — or ask when it will be released)"
         )
         state["current_step"] = "wait_avail_period"
         state["intent"] = "availability"
@@ -904,8 +1044,8 @@ async def handle_availability(state: ChatState) -> ChatState:
         )
     else:
         state["reply"] = (
-            f"No — {matched['title']} is not available in {label}.\n"
-            f"Try another month or ask about a different property."
+            f"No — {matched['title']} is not available in {label}.\n\n"
+            f"{_release_info_reply(matched['id'])}"
         )
 
     state["intent"] = None
