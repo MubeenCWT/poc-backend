@@ -34,6 +34,7 @@ class PropertyCreate(BaseModel):
 
 class PropertyOut(PropertyCreate):
     id: str
+    owner_id: Optional[str] = None
     status: str
     created_at: datetime
 

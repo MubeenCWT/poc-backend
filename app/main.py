@@ -5,7 +5,7 @@ from sqlalchemy import text
 
 from app.database import Base, engine
 from app.models import models
-from app.routers import auth, properties, bookings, vendors, maintenance, chat, notifications, whatsapp_webhook
+from app.routers import auth, properties, bookings, vendors, maintenance, chat, notifications, whatsapp_webhook, owners
 
 
 def _ensure_columns():
@@ -43,6 +43,7 @@ app.include_router(vendors.router, prefix="/api")
 app.include_router(maintenance.router, prefix="/api")
 app.include_router(chat.router, prefix="/api")
 app.include_router(notifications.router, prefix="/api")
+app.include_router(owners.router, prefix="/api")
 app.include_router(whatsapp_webhook.router)  # no /api prefix — Meta calls /webhook/whatsapp
 
 @app.get("/api")

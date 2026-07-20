@@ -64,6 +64,9 @@ async def _push_text(to: str, message: str, buttons=None):
 
 @router.get("/check-availability")
 def check_availability(property_id: str, start_date: str, end_date: str, db: Session = Depends(get_db)):
+    prop = db.query(Property).filter(Property.id == property_id).first()
+    if not prop or prop.status != "active":
+        return {"available": False}
     if _has_conflict(db, property_id, start_date, end_date):
         return {"available": False}
     return {"available": True}
@@ -85,6 +88,9 @@ async def create_booking(
     prop = db.query(Property).filter(Property.id == payload.property_id).first()
     if not prop:
         raise HTTPException(404, "Property not found")
+
+    if prop.status != "active":
+        raise HTTPException(409, "Property is not available for booking")
 
     if _has_conflict(db, payload.property_id, payload.start_date, payload.end_date):
         raise HTTPException(409, "Property is not available for the selected dates")

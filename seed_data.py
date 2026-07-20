@@ -1,6 +1,7 @@
 from app.database import SessionLocal, Base, engine
 from app.models.models import Property, Vendor, User
 from app.services.auth import hash_password
+from app.config import settings
 
 Base.metadata.create_all(bind=engine)
 
@@ -19,6 +20,24 @@ def run_seed():
             db.add(admin)
             db.commit()
             print("Admin created.")
+
+        # 1b. Demo owner for WhatsApp portfolio commands
+        owner_phone = (settings.OWNER_WHATSAPP_NUMBER or "+971509999999").strip()
+        if not owner_phone.startswith("+"):
+            owner_phone = f"+{owner_phone.lstrip('+')}"
+        owner = db.query(User).filter(User.role == "owner", User.phone == owner_phone).first()
+        if not owner:
+            owner = User(
+                role="owner",
+                full_name="Demo Property Owner",
+                email="owner@uaestays.ae",
+                phone=owner_phone,
+                is_active=True,
+            )
+            db.add(owner)
+            db.commit()
+            db.refresh(owner)
+            print(f"Owner created (WhatsApp: {owner_phone}).")
         
         # 2. Seed Vendors
         vendors_data = [
@@ -93,6 +112,14 @@ def run_seed():
                 db.add(Property(**p))
             db.commit()
             print("Properties seeded.")
+
+        # Assign Marina + JBR units to demo owner when still under admin
+        if owner:
+            for title in ("Luxury Marina Apartment", "JBR Penthouse", "Jumeirah Beach Residence"):
+                prop = db.query(Property).filter(Property.title == title).first()
+                if prop and prop.owner_id == admin.id:
+                    prop.owner_id = owner.id
+            db.commit()
             
     except Exception as e:
         print(f"Error seeding data: {e}")
