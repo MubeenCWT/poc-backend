@@ -321,3 +321,7 @@ def _reply_release(db: Session, prop) -> str:
     if release:
         parts.append(f"Available for new bookings from: {_fmt_date(release)}")
     return "\n".join(parts)
+
+
+# Older deployments imported this name
+handle_owner_message = handle_admin_portfolio_message
