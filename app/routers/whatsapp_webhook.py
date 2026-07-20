@@ -460,14 +460,17 @@ async def _try_admin_portfolio_message(phone: str, text: str, db) -> bool:
     db.add(ChatbotMessage(session_id=session.id, direction="inbound", message_text=text))
 
     state = dict(session.state or {})
-    reply, new_state = await handle_admin_portfolio_message(db, text, state)
+    reply, new_state, reply_buttons = await handle_admin_portfolio_message(db, text, state)
 
     session.state = new_state
     session.last_intent = "admin_portfolio"
     db.add(ChatbotMessage(session_id=session.id, direction="outbound", message_text=reply))
     db.commit()
 
-    await send_whatsapp_text(phone, reply)
+    if reply_buttons:
+        await send_whatsapp_buttons(phone, reply, reply_buttons)
+    else:
+        await send_whatsapp_text(phone, reply)
     return True
 
 
