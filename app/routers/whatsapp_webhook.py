@@ -13,7 +13,7 @@ import re
 from fastapi import APIRouter, BackgroundTasks, Query, Request, Response
 
 from app.chatbot.graph import chatbot_graph
-from app.chatbot.owner_graph import handle_admin_portfolio_message
+from app.chatbot.owner_graph import handle_admin_portfolio_message, find_admin_by_phone
 from app.config import settings
 from app.database import SessionLocal
 from app.models.models import Booking, ChatbotMessage, ChatbotSession
@@ -30,7 +30,6 @@ from app.services.booking_confirm import (
     admin_payment_buttons,
 )
 from app.services.notify import send_whatsapp_text, send_whatsapp_buttons, send_admin_alert
-from app.services.owner_portfolio import find_admin_by_phone
 
 logger = logging.getLogger(__name__)
 
