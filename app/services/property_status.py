@@ -47,12 +47,30 @@ def property_block_fields(db: Session, prop: Property) -> dict:
     today = _today()
     block = get_current_or_next_block(db, prop.id, today)
     active_today = is_blocked_on(db, prop.id, today)
+    current = (
+        db.query(PropertyAvailability)
+        .filter(
+            PropertyAvailability.property_id == prop.id,
+            PropertyAvailability.status.in_(["booked", "blocked"]),
+            PropertyAvailability.start_date <= today,
+            PropertyAvailability.end_date >= today,
+        )
+        .order_by(PropertyAvailability.end_date.desc())
+        .first()
+    )
+    availability_status = "offline" if prop.status != "active" else (
+        current.status if current else "available"
+    )
+    next_available = current.end_date + datetime.timedelta(days=1) if current else today
+
     if not block:
         return {
             "block_active": False,
             "block_start": None,
             "block_end": None,
             "listing_label": "live" if prop.status == "active" else "removed",
+            "availability_status": availability_status,
+            "next_available_date": None if availability_status == "offline" else next_available,
         }
     label = "blocked" if active_today else "blocked_soon"
     if prop.status != "active":
@@ -62,6 +80,8 @@ def property_block_fields(db: Session, prop: Property) -> dict:
         "block_start": block.start_date,
         "block_end": block.end_date,
         "listing_label": label,
+        "availability_status": availability_status,
+        "next_available_date": None if availability_status == "offline" else next_available,
     }
 
 

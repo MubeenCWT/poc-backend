@@ -3,8 +3,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models.models import Property, User
-from app.schemas.schemas import PropertyCreate, PropertyOut
+from app.models.models import Property, PropertyAvailability, User
+from app.schemas.schemas import PropertyBlockRequest, PropertyCreate, PropertyOut
 from app.services.deps import get_current_admin, get_optional_admin
 from app.services.property_status import serialize_property
 
@@ -85,6 +85,87 @@ def update_property(
         raise HTTPException(status_code=404, detail="Property not found")
     for key, value in payload.model_dump().items():
         setattr(prop, key, value)
+    db.commit()
+    db.refresh(prop)
+    return _property_out(db, prop)
+
+
+@router.post("/{property_id}/block", response_model=PropertyOut)
+def block_property(
+    property_id: str,
+    payload: PropertyBlockRequest,
+    db: Session = Depends(get_db),
+    admin: User = Depends(get_current_admin),
+):
+    """Admin-only: prevent bookings for a property during a date range."""
+    prop = db.query(Property).filter(Property.id == property_id).first()
+    if not prop:
+        raise HTTPException(status_code=404, detail="Property not found")
+    if payload.end_date < payload.start_date:
+        raise HTTPException(status_code=400, detail="End date must be on or after start date")
+
+    conflict = (
+        db.query(PropertyAvailability)
+        .filter(
+            PropertyAvailability.property_id == property_id,
+            PropertyAvailability.status.in_(["booked", "blocked"]),
+            PropertyAvailability.start_date <= payload.end_date,
+            PropertyAvailability.end_date >= payload.start_date,
+        )
+        .first()
+    )
+    if conflict:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Dates overlap an existing {conflict.status} period "
+                f"({conflict.start_date} to {conflict.end_date})"
+            ),
+        )
+
+    db.add(
+        PropertyAvailability(
+            property_id=property_id,
+            start_date=payload.start_date,
+            end_date=payload.end_date,
+            status="blocked",
+        )
+    )
+    db.commit()
+    db.refresh(prop)
+    return _property_out(db, prop)
+
+
+@router.delete("/{property_id}/block", response_model=PropertyOut)
+def clear_property_blocks(
+    property_id: str,
+    db: Session = Depends(get_db),
+    admin: User = Depends(get_current_admin),
+):
+    """Admin-only: clear current and future owner-created date blocks."""
+    prop = db.query(Property).filter(Property.id == property_id).first()
+    if not prop:
+        raise HTTPException(status_code=404, detail="Property not found")
+    db.query(PropertyAvailability).filter(
+        PropertyAvailability.property_id == property_id,
+        PropertyAvailability.status == "blocked",
+    ).delete(synchronize_session=False)
+    db.commit()
+    db.refresh(prop)
+    return _property_out(db, prop)
+
+
+@router.post("/{property_id}/offline", response_model=PropertyOut)
+def take_property_offline(
+    property_id: str,
+    db: Session = Depends(get_db),
+    admin: User = Depends(get_current_admin),
+):
+    """Admin-only: hide a property from public listings."""
+    prop = db.query(Property).filter(Property.id == property_id).first()
+    if not prop:
+        raise HTTPException(status_code=404, detail="Property not found")
+    prop.status = "inactive"
     db.commit()
     db.refresh(prop)
     return _property_out(db, prop)

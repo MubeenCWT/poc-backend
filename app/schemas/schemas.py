@@ -32,6 +32,11 @@ class PropertyCreate(BaseModel):
     price_yearly: Optional[float] = None
 
 
+class PropertyBlockRequest(BaseModel):
+    start_date: date
+    end_date: date
+
+
 class PropertyOut(PropertyCreate):
     id: str
     owner_id: Optional[str] = None
@@ -41,6 +46,8 @@ class PropertyOut(PropertyCreate):
     block_start: Optional[date] = None
     block_end: Optional[date] = None
     listing_label: str = "live"  # live | blocked | blocked_soon | removed
+    availability_status: str = "available"  # available | booked | blocked | offline
+    next_available_date: Optional[date] = None
 
     class Config:
         from_attributes = True
