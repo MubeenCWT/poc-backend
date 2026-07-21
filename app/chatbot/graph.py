@@ -511,7 +511,8 @@ async def classify_intent(state: ChatState) -> ChatState:
             state["intent"] = "maintenance"
             return state
 
-    lower = state["incoming_message"].lower()
+    msg = state.get("incoming_message") or ""
+    lower = msg.lower()
 
     # Property inquire from website deep-link or freeform
     if any(p in lower for p in INQUIRE_PHRASES):
