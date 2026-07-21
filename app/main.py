@@ -5,7 +5,17 @@ from sqlalchemy import text
 
 from app.database import Base, engine
 from app.models import models
-from app.routers import auth, properties, bookings, vendors, maintenance, chat, notifications, whatsapp_webhook
+from app.routers import (
+    auth,
+    bookings,
+    chat,
+    maintenance,
+    notifications,
+    properties,
+    property_management,
+    vendors,
+    whatsapp_webhook,
+)
 
 
 def _ensure_columns():
@@ -38,6 +48,7 @@ app.add_middleware(
 
 app.include_router(auth.router, prefix="/api")
 app.include_router(properties.router, prefix="/api")
+app.include_router(property_management.router, prefix="/api")
 app.include_router(bookings.router, prefix="/api")
 app.include_router(vendors.router, prefix="/api")
 app.include_router(maintenance.router, prefix="/api")
