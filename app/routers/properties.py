@@ -165,7 +165,7 @@ def take_property_offline(
     prop = db.query(Property).filter(Property.id == property_id).first()
     if not prop:
         raise HTTPException(status_code=404, detail="Property not found")
-    prop.status = "inactive"
+    prop.status = "offline"
     db.commit()
     db.refresh(prop)
     return _property_out(db, prop)

@@ -68,12 +68,18 @@ def property_block_fields(db: Session, prop: Property) -> dict:
             "block_active": False,
             "block_start": None,
             "block_end": None,
-            "listing_label": "live" if prop.status == "active" else "removed",
+            "listing_label": (
+                "live" if prop.status == "active"
+                else "offline" if prop.status == "offline"
+                else "removed"
+            ),
             "availability_status": availability_status,
             "next_available_date": None if availability_status == "offline" else next_available,
         }
     label = "blocked" if active_today else "blocked_soon"
-    if prop.status != "active":
+    if prop.status == "offline":
+        label = "offline"
+    elif prop.status != "active":
         label = "removed"
     return {
         "block_active": active_today,

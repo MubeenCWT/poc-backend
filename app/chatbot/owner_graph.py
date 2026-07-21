@@ -281,7 +281,7 @@ def take_property_offline(
     end_date: datetime.date,
 ) -> None:
     block_property_dates(db, prop, start_date, end_date)
-    prop.status = "inactive"
+    prop.status = "offline"
     db.commit()
     db.refresh(prop)
 
